@@ -1,127 +1,235 @@
-from pypdf import PdfReader
-from typing import List
 import re
-import logging
+from typing import List
+from PyPDF2 import PdfReader
 
-logger = logging.getLogger(__name__)
+def _normalize_pdf_text(text: str) -> str:
+    """
+    Normalize text extracted from PDFs:
+    - Normalize line endings
+    - Convert bullet-like unicode chars to a common form
+    - Merge hard-wrapped lines inside paragraphs
+    - Preserve paragraph breaks
+    """
+    if not text:
+        return ""
 
-def extract_text_from_pdf(file_path: str, chunk_size: int = 1000) -> List[str]:
+    # Normalize newlines
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Common bullet chars -> "-"
+    text = text.replace("\u2022", "-").replace("\u25cf", "-").replace("\u2219", "-")
+
+    # Trim trailing spaces on lines
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+
+    # Collapse 3+ newlines to 2 (keep paragraph breaks)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Merge wrapped lines: replace single newlines within paragraphs with spaces.
+    # Keep double newlines as paragraph separators.
+    # Also keep newlines before list items / headings heuristically.
+    lines = text.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line == "":
+            out.append("")  # paragraph break marker
+            i += 1
+            continue
+
+        # If next line exists and is not empty, decide whether to merge
+        if i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+
+            # Keep newline if current looks like a heading or list item
+            is_heading = (len(line) < 80 and line.isupper())
+            is_list = bool(re.match(r"^(\-|\*|\u2022|\d+[\.\)]|[a-zA-Z][\.\)])\s+", line))
+            next_is_list = bool(re.match(r"^(\-|\*|\u2022|\d+[\.\)]|[a-zA-Z][\.\)])\s+", nxt))
+
+            if nxt != "" and not is_heading and not is_list and not next_is_list:
+                # Merge if line doesn't end a sentence strongly (but still merge often in PDFs)
+                # Also avoid merging if line ends with hyphenated word break: "exam-\nple" -> "example"
+                if line.endswith("-") and nxt and nxt[0].islower():
+                    out.append(line[:-1] + nxt)
+                    i += 2
+                    continue
+                else:
+                    out.append(line + " " + nxt)
+                    i += 2
+                    continue
+
+        out.append(line)
+        i += 1
+
+    # Rebuild with paragraphs
+    normalized = "\n".join(out)
+    # Restore paragraph breaks from empty lines, collapse multiple empties to two newlines
+    normalized = re.sub(r"\n\s*\n", "\n\n", normalized)
+    normalized = re.sub(r"[ \t]{2,}", " ", normalized).strip()
+    return normalized
+
+
+def _split_sentences(text: str) -> List[str]:
+    """
+    A practical sentence splitter (regex-based). Not perfect, but better than naive.
+    """
+    # Protect some common abbreviations to reduce bad splits
+    protected = [
+        "e.g.", "i.e.", "Mr.", "Mrs.", "Ms.", "Dr.", "Prof.", "vs.", "etc.",
+        "Fig.", "Eq.", "No.", "St.", "Inc.", "Ltd."
+    ]
+    placeholder = "§§§"
+    for ab in protected:
+        text = text.replace(ab, ab.replace(".", placeholder))
+
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", text.strip())
+    parts = [p.replace(placeholder, ".").strip() for p in parts if p.strip()]
+    return parts if parts else [text.strip()]
+
+
+def _chunk_text(text: str, chunk_size: int, chunk_overlap: int = 100) -> List[str]:
+    """
+    Chunk text with preference for paragraph boundaries, then sentence, then word.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if chunk_overlap < 0:
+        raise ValueError("chunk_overlap must be >= 0")
+    if chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be < chunk_size")
+
+    text = text.strip()
+    if not text:
+        return []
+
+    # Paragraph-like blocks
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+
+    chunks: List[str] = []
+    current = ""
+
+    def flush():
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for block in blocks:
+        # If block fits, add it
+        if len(block) <= chunk_size:
+            if not current:
+                current = block
+            elif len(current) + 2 + len(block) <= chunk_size:
+                current = current + "\n\n" + block
+            else:
+                flush()
+                current = block
+            continue
+
+        # Block too large: flush current, then split block by sentences
+        flush()
+        sentences = _split_sentences(block)
+
+        # Build chunk(s) from sentences
+        buf = ""
+        for s in sentences:
+            if len(s) > chunk_size:
+                # Sentence too large: split by words
+                words = s.split()
+                wbuf = ""
+                for w in words:
+                    if not wbuf:
+                        wbuf = w
+                    elif len(wbuf) + 1 + len(w) <= chunk_size:
+                        wbuf = wbuf + " " + w
+                    else:
+                        chunks.append(wbuf.strip())
+                        wbuf = w
+                if wbuf.strip():
+                    chunks.append(wbuf.strip())
+                buf = ""
+                continue
+
+            if not buf:
+                buf = s
+            elif len(buf) + 1 + len(s) <= chunk_size:
+                buf = buf + " " + s
+            else:
+                chunks.append(buf.strip())
+                buf = s
+
+        if buf.strip():
+            chunks.append(buf.strip())
+
+    flush()
+
+    # Apply overlap (character-based) between final chunks
+    if chunk_overlap > 0 and len(chunks) > 1:
+        overlapped = []
+        for i, c in enumerate(chunks):
+            if i == 0:
+                overlapped.append(c)
+                continue
+            prev = overlapped[-1]
+            overlap = prev[-chunk_overlap:] if len(prev) > chunk_overlap else prev
+            overlapped.append((overlap + "\n" + c).strip())
+        chunks = overlapped
+
+    return chunks
+
+
+def extract_text_from_pdf(file_path: str, chunk_size: int = 1000, chunk_overlap: int = 100) -> List[str]:
     """
     Extract text from PDF and split into chunks.
-    
+
     Args:
         file_path: Path to the PDF file
         chunk_size: Maximum characters per chunk
-    
+        chunk_overlap: Character overlap between chunks (good for RAG)
+
     Returns:
         List of text chunks
-    
+
     Raises:
         Exception: If PDF cannot be read or is encrypted
     """
     try:
         reader = PdfReader(file_path)
-        
-        # Check if PDF is encrypted
+
         if reader.is_encrypted:
             try:
-                # Try to decrypt with empty password (common case)
                 reader.decrypt("")
             except Exception as e:
-                logger.warning(f"PDF is encrypted and cannot be decrypted: {str(e)}")
                 raise Exception(f"PDF is encrypted and cannot be decrypted: {str(e)}")
-        
-        num_pages = len(reader.pages)
-        logger.info(f"Processing PDF with {num_pages} pages")
-        
-        if num_pages == 0:
+
+        if len(reader.pages) == 0:
             raise Exception("PDF has no pages")
-        
-        text = ""
+
+        full_text_parts = []
         pages_with_text = 0
-        
-        # Extract text from all pages
+
         for i, page in enumerate(reader.pages):
             try:
-                page_text = page.extract_text()
-                if page_text and page_text.strip():
-                    text += page_text + "\n"
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    full_text_parts.append(page_text)
                     pages_with_text += 1
-                else:
-                    logger.warning(f"Page {i+1} returned no text (may be image-based)")
-            except Exception as e:
-                logger.warning(f"Error extracting text from page {i+1}: {str(e)}")
+            except Exception:
+                # skip problematic pages
                 continue
-        
-        text = text.strip()
-        
-        if not text:
-            logger.error(f"No text extracted from PDF. Pages processed: {num_pages}, Pages with text: {pages_with_text}")
+
+        raw_text = "\n\n&&&".join(full_text_parts).strip()
+        if not raw_text:
             raise Exception(
                 f"No text could be extracted from the PDF. "
                 f"This may be an image-based (scanned) PDF. "
-                f"Processed {num_pages} pages, found text on {pages_with_text} pages."
+                f"Processed {len(reader.pages)} pages, found text on {pages_with_text} pages."
             )
-        
-        logger.info(f"Successfully extracted text from {pages_with_text}/{num_pages} pages")
-        
-    except Exception as e:
-        logger.error(f"Error reading PDF file: {str(e)}")
-        raise
-    
-    # Check if text has paragraph separators (\n\n)
-    has_paragraph_separators = "\n\n" in text
-    
-    chunks = []
-    
-    if has_paragraph_separators:
-        # Split by paragraphs if they exist
-        current_chunk = ""
-        
-        for paragraph in text.split("\n\n"):
-            paragraph = paragraph.strip()
-            if not paragraph:
-                continue
-                
-            if len(current_chunk) + len(paragraph) + 1 <= chunk_size:
-                current_chunk += paragraph + "\n\n"
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = paragraph + "\n\n"
-        
-        # Add remaining chunk
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-    else:
-        # No paragraph separators - split by character count or sentences
-        # Try to split by sentences first (period followed by space or newline)
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        
-        if len(sentences) > 1:
-            # Split by sentences
-            current_chunk = ""
-            for sentence in sentences:
-                sentence = sentence.strip()
-                if not sentence:
-                    continue
-                    
-                if len(current_chunk) + len(sentence) + 1 <= chunk_size:
-                    current_chunk += sentence + " "
-                else:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = sentence + " "
-            
-            # Add remaining chunk
-            if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-        else:
-            # No sentence separators either - split by character count
-            for i in range(0, len(text), chunk_size):
-                chunk = text[i:i + chunk_size].strip()
-                if chunk:
-                    chunks.append(chunk)
-    
-    return chunks if chunks else [text]
 
+        normalized = _normalize_pdf_text(raw_text)
+        chunks = _chunk_text(normalized, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        return chunks if chunks else [normalized]
+
+    except Exception:
+        raise
