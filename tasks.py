@@ -2,7 +2,7 @@ import os
 from celery_app import celery_app
 from config import WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, UPLOAD_DIR
 from pdf_processor import extract_text_from_pdf
-from vector_store import VectorStore
+from vector_store import get_vector_store
 from elasticsearch_store import ElasticsearchStore
 
 @celery_app.task(name="process_pdf")
@@ -49,8 +49,8 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
                 "message": "No text extracted from PDF. The PDF may be image-based (scanned) or corrupted."
             }
         
-        # Initialize vector store (for semantic search)
-        vector_store = VectorStore(WEAVIATE_URL, EMBEDDING_MODEL)
+        # Use singleton instance (model loaded once per Celery worker process)
+        vector_store = get_vector_store(WEAVIATE_URL, EMBEDDING_MODEL)
         
         # Initialize Elasticsearch store (for keyword search)
         elasticsearch_store = ElasticsearchStore(ELASTICSEARCH_URL)
@@ -76,9 +76,8 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
             os.remove(file_path)
         return {"status": "error", "message": str(e)}
     finally:
-        # Close connections
-        if vector_store:
-            vector_store.close()
+        # Note: Don't close vector_store since it's a singleton
+        # Only close elasticsearch_store
         if elasticsearch_store:
             elasticsearch_store.close()
 

@@ -1,5 +1,5 @@
 import re
-from typing import List
+from typing import List, Dict, Tuple, Any
 from PyPDF2 import PdfReader
 
 def _normalize_pdf_text(text: str) -> str:
@@ -88,7 +88,7 @@ def _split_sentences(text: str) -> List[str]:
     return parts if parts else [text.strip()]
 
 
-def _chunk_text(text: str, chunk_size: int, chunk_overlap: int = 100) -> List[str]:
+def _chunk_text(text: str, chunk_size: int, chunk_overlap: int = 500) -> List[str]:
     """
     Chunk text with preference for paragraph boundaries, then sentence, then word.
     """
@@ -164,24 +164,41 @@ def _chunk_text(text: str, chunk_size: int, chunk_overlap: int = 100) -> List[st
 
     flush()
 
-    # Apply overlap (character-based) between final chunks
+    # Apply overlap between chunks
     if chunk_overlap > 0 and len(chunks) > 1:
         overlapped = []
-        for i, c in enumerate(chunks):
+        for i, chunk in enumerate(chunks):
             if i == 0:
-                overlapped.append(c)
+                overlapped.append(chunk)
                 continue
-            prev = overlapped[-1]
-            overlap = prev[-chunk_overlap:] if len(prev) > chunk_overlap else prev
-            overlapped.append((overlap + "\n" + c).strip())
+            
+            # Get last N sentences from previous chunk for overlap
+            prev_sentences = _split_sentences(chunks[i - 1])
+            overlap_sentences = []
+            total_len = 0
+            
+            for sentence in reversed(prev_sentences):
+                sentence_len = len(sentence) + 1
+                if total_len + sentence_len <= chunk_overlap:
+                    overlap_sentences.insert(0, sentence)
+                    total_len += sentence_len
+                else:
+                    break
+            
+            if overlap_sentences:
+                overlapped.append(" ".join(overlap_sentences) + " " + chunk)
+            else:
+                overlapped.append(chunk)
+        
         chunks = overlapped
 
     return chunks
 
 
-def extract_text_from_pdf(file_path: str, chunk_size: int = 1000, chunk_overlap: int = 100) -> List[str]:
+
+def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: int = 300) -> List[Dict[str, Any]]:
     """
-    Extract text from PDF and split into chunks.
+    Extract text from PDF and split into chunks with page numbers.
 
     Args:
         file_path: Path to the PDF file
@@ -189,7 +206,7 @@ def extract_text_from_pdf(file_path: str, chunk_size: int = 1000, chunk_overlap:
         chunk_overlap: Character overlap between chunks (good for RAG)
 
     Returns:
-        List of text chunks
+        List of dictionaries with 'text' and 'page_number' keys
 
     Raises:
         Exception: If PDF cannot be read or is encrypted
@@ -206,30 +223,50 @@ def extract_text_from_pdf(file_path: str, chunk_size: int = 1000, chunk_overlap:
         if len(reader.pages) == 0:
             raise Exception("PDF has no pages")
 
-        full_text_parts = []
+        # Extract text from each page, keeping track of page numbers
+        text_blocks: List[Tuple[str, int]] = []
         pages_with_text = 0
 
         for i, page in enumerate(reader.pages):
             try:
                 page_text = page.extract_text() or ""
                 if page_text.strip():
-                    full_text_parts.append(page_text)
+                    # Page numbers are 1-indexed for user display
+                    text_blocks.append((page_text, i + 1))
                     pages_with_text += 1
             except Exception:
                 # skip problematic pages
                 continue
 
-        raw_text = "\n\n&&&".join(full_text_parts).strip()
-        if not raw_text:
+        if not text_blocks:
             raise Exception(
                 f"No text could be extracted from the PDF. "
                 f"This may be an image-based (scanned) PDF. "
                 f"Processed {len(reader.pages)} pages, found text on {pages_with_text} pages."
             )
 
-        normalized = _normalize_pdf_text(raw_text)
-        chunks = _chunk_text(normalized, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        return chunks if chunks else [normalized]
+        # Chunk each page separately and combine with page numbers
+        all_chunks = []
+        for page_text, page_num in text_blocks:
+            normalized = _normalize_pdf_text(page_text)
+            if not normalized:
+                continue
+            
+            page_chunks = _chunk_text(normalized, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            
+            # Add page number to each chunk
+            for chunk_text in page_chunks:
+                all_chunks.append({
+                    "text": chunk_text,
+                    "page_number": page_num
+                })
+        
+        # Fallback: if no chunks, return the full normalized text from first page
+        if not all_chunks:
+            normalized = _normalize_pdf_text(text_blocks[0][0])
+            return [{"text": normalized, "page_number": text_blocks[0][1]}]
+        
+        return all_chunks
 
     except Exception:
         raise

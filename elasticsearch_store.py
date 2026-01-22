@@ -43,12 +43,12 @@ class ElasticsearchStore:
                         "chunk_count": {
                             "type": "integer"
                         },
+                        "page_number": {
+                            "type": "integer"
+                        },
                         "text": {
                             "type": "text",
                             "analyzer": "standard"
-                        },
-                        "text_preview": {
-                            "type": "text"
                         }
                     }
                 }
@@ -56,20 +56,33 @@ class ElasticsearchStore:
             # Elasticsearch 8.x uses mappings parameter directly
             self.client.indices.create(index=self.index_name, mappings=mapping["mappings"])
     
-    def add_documents(self, file_id: str, text_chunks: List[str], filename: str = ""):
+    def add_documents(self, file_id: str, text_chunks: List, filename: str = ""):
         """
         Add documents to Elasticsearch.
         
         Args:
             file_id: Unique identifier for the file
-            text_chunks: List of text chunks to store
+            text_chunks: List of text chunks (dicts with 'text' and 'page_number' keys, or strings for backward compatibility)
             filename: Original filename of the document
         """
-        chunk_count = len(text_chunks)
+        # Extract text from chunks (handle both dict and string formats)
+        chunk_texts = []
+        chunk_pages = []
+        for chunk in text_chunks:
+            if isinstance(chunk, dict):
+                chunk_texts.append(chunk["text"])
+                chunk_pages.append(chunk.get("page_number", 1))
+            else:
+                # Backward compatibility: treat as string
+                chunk_texts.append(chunk)
+                chunk_pages.append(1)
+        
+        chunk_count = len(chunk_texts)
+        page_count = len(set(chunk_pages))
         
         # Prepare bulk operations
         actions = []
-        for i, chunk in enumerate(text_chunks):
+        for i, (chunk_text, page_num) in enumerate(zip(chunk_texts, chunk_pages)):
             doc = {
                 "_index": self.index_name,
                 "_id": f"{file_id}_chunk_{i}",
@@ -78,8 +91,9 @@ class ElasticsearchStore:
                     "filename": filename,
                     "chunk_index": i,
                     "chunk_count": chunk_count,
-                    "text": chunk,
-                    "text_preview": chunk[:200]
+                    "page_number": page_num,
+                    "page_count": page_count,
+                    "text": chunk_text,
                 }
             }
             actions.append(doc)
@@ -111,7 +125,7 @@ class ElasticsearchStore:
                         {
                             "multi_match": {
                                 "query": query,
-                                "fields": ["text^2", "text_preview", "filename"],
+                                "fields": ["text^2", "filename"],
                                 "type": "best_fields",
                                 "fuzziness": "AUTO"
                             }
@@ -120,7 +134,7 @@ class ElasticsearchStore:
                 }
             },
             "size": n_results,
-            "_source": ["file_id", "filename", "chunk_index", "chunk_count", "text", "text_preview"],
+            "_source": ["file_id", "filename", "chunk_index", "chunk_count", "page_number", "text"],
             "highlight": {
                 "fields": {
                     "text": {
@@ -154,6 +168,7 @@ class ElasticsearchStore:
                 "filename": source["filename"],
                 "chunk_index": source["chunk_index"],
                 "chunk_count": source["chunk_count"],
+                "page_number": source.get("page_number", 1),
                 "score": hit["_score"]
             }
             
@@ -211,7 +226,7 @@ class ElasticsearchStore:
                             "top_hits": {
                                 "size": 1,
                                 "sort": [{"chunk_index": {"order": "asc"}}],
-                                "_source": ["filename", "chunk_count"]
+                                "_source": ["filename", "chunk_count", "page_count"]
                             }
                         }
                     }
@@ -220,18 +235,91 @@ class ElasticsearchStore:
         }
         
         response = self.client.search(index=self.index_name, body=search_body)
-        
         documents = []
         for bucket in response["aggregations"]["unique_docs"]["buckets"]:
             file_id = bucket["key"]
             first_chunk = bucket["first_chunk"]["hits"]["hits"][0]["_source"]
+            print(first_chunk)
             documents.append({
                 "file_id": file_id,
                 "filename": first_chunk.get("filename", ""),
-                "chunk_count": first_chunk.get("chunk_count", 0)
+                "chunk_count": first_chunk.get("chunk_count", 0),
+                "page_count": first_chunk.get("page_count", 0)
             })
         
         return documents
+    
+    def delete_document(self, file_id: str) -> int:
+        """
+        Delete all chunks for a given document by file_id.
+        
+        Args:
+            file_id: Unique identifier for the file to delete
+        
+        Returns:
+            Number of chunks deleted
+        """
+        # Use delete_by_query to delete all documents with matching file_id
+        delete_body = {
+            "query": {
+                "term": {
+                    "file_id": file_id
+                }
+            }
+        }
+        
+        response = self.client.delete_by_query(
+            index=self.index_name,
+            body=delete_body,
+            refresh=True  # Refresh index immediately after deletion
+        )
+        
+        return response.get("deleted", 0)
+    
+    def get_chunks_by_range(self, file_id: str, chunk_indices: List[int]):
+        """
+        Get chunks by file_id and list of chunk indices.
+        
+        Args:
+            file_id: Unique identifier for the file
+            chunk_indices: List of chunk indices to retrieve
+        
+        Returns:
+            List of chunk objects sorted by chunk_index
+        """
+        if not chunk_indices:
+            return []
+        
+        # Build query to get chunks by file_id and chunk_index
+        search_body = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"file_id": file_id}},
+                        {"terms": {"chunk_index": chunk_indices}}
+                    ]
+                }
+            },
+            "size": len(chunk_indices),
+            "_source": ["file_id", "filename", "chunk_index", "chunk_count", "page_number", "text"],
+            "sort": [{"chunk_index": {"order": "asc"}}]
+        }
+        
+        response = self.client.search(index=self.index_name, body=search_body)
+        
+        # Format results
+        chunks = []
+        for hit in response["hits"]["hits"]:
+            source = hit["_source"]
+            chunks.append({
+                "chunk_index": source["chunk_index"],
+                "text": source["text"],
+                "file_id": source["file_id"],
+                "filename": source["filename"],
+                "page_number": source.get("page_number", 1)
+            })
+        
+        return chunks
     
     def close(self):
         """Close the Elasticsearch connection."""
