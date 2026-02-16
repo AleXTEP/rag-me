@@ -108,46 +108,50 @@ class ElasticsearchStore:
     def search(self, query: str, n_results: int = 5, filename: Optional[str] = None):
         """
         Search for documents by keywords.
-        
+        Prioritizes chunks that contain the exact phrase (e.g. "type confusion"
+        together) over chunks where the words appear in different parts.
+
         Args:
-            query: Search query (keywords)
+            query: Search query (keywords or phrase)
             n_results: Number of results to return
             filename: Optional filename filter
-        
+
         Returns:
             Search results
         """
-        # Build search query
-        search_body = {
-            "query": {
-                "bool": {
-                    "must": [
-                        {
-                            "multi_match": {
-                                "query": query,
-                                "fields": ["text^2", "filename"],
-                                "type": "best_fields",
-                                "fuzziness": "AUTO"
-                            }
+        # Build bool with should: phrase match (boosted) + multi_match (keywords)
+        # Phrase match ranks higher when words appear together in order
+        bool_query = {
+            "should": [
+                {
+                    "match_phrase": {
+                        "text": {
+                            "query": query.strip(),
+                            "boost": 3
                         }
-                    ]
-                }
-            },
-            "size": n_results,
-            "_source": ["file_id", "filename", "chunk_index", "chunk_count", "page_number", "text"],
-            "highlight": {
-                "fields": {
-                    "text": {
-                        "fragment_size": 150,
-                        "number_of_fragments": 1
+                    }
+                },
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": ["text^2", "filename"],
+                        "type": "best_fields",
+                        "fuzziness": "AUTO"
                     }
                 }
-            }
+            ],
+            "minimum_should_match": 1
         }
-        
+
+        search_body = {
+            "query": {"bool": bool_query},
+            "size": n_results,
+            "_source": ["file_id", "filename", "chunk_index", "chunk_count", "page_number", "text"]
+        }
+
         # Add filename filter if provided
         if filename:
-            search_body["query"]["bool"]["filter"] = [
+            bool_query["filter"] = [
                 {"term": {"filename.keyword": filename}}
             ]
         
@@ -171,11 +175,6 @@ class ElasticsearchStore:
                 "page_number": source.get("page_number", 1),
                 "score": hit["_score"]
             }
-            
-            # Add highlighted text if available
-            if "highlight" in hit and "text" in hit["highlight"]:
-                result["highlight"] = hit["highlight"]["text"][0]
-            
             formatted_results["objects"].append(result)
         
         return formatted_results
@@ -239,7 +238,6 @@ class ElasticsearchStore:
         for bucket in response["aggregations"]["unique_docs"]["buckets"]:
             file_id = bucket["key"]
             first_chunk = bucket["first_chunk"]["hits"]["hits"][0]["_source"]
-            print(first_chunk)
             documents.append({
                 "file_id": file_id,
                 "filename": first_chunk.get("filename", ""),
