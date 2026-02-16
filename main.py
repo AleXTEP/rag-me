@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Generator
 import os
 import uuid
 from config import UPLOAD_DIR, WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL
@@ -15,6 +15,15 @@ app = FastAPI(title="RAG System API", version="1.0.0")
 def get_vector_store_dependency() -> VectorStore:
     """FastAPI dependency that returns a singleton VectorStore instance."""
     return get_vector_store(WEAVIATE_URL, EMBEDDING_MODEL)
+
+
+def get_elasticsearch_store() -> Generator[ElasticsearchStore, None, None]:
+    """FastAPI dependency that provides an ElasticsearchStore and closes it after the request."""
+    store = ElasticsearchStore(ELASTICSEARCH_URL)
+    try:
+        yield store
+    finally:
+        store.close()
 
 def combine_search_results_with_rrf(weaviate_results: dict, elasticsearch_results: dict, search_limit: int, rrf_k: int = 60):
     """
@@ -200,15 +209,15 @@ def get_task_status(task_id: str):
     return response
 
 @app.get("/documents")
-def list_documents():
+def list_documents(
+    elasticsearch_store: ElasticsearchStore = Depends(get_elasticsearch_store)
+):
     """
     Get a list of all documents in the system with their metadata.
     Returns file_id, filename, and chunk_count for each document.
     Uses Elasticsearch for faster retrieval via aggregations.
     """
-    elasticsearch_store = None
     try:
-        elasticsearch_store = ElasticsearchStore(ELASTICSEARCH_URL)
         documents = elasticsearch_store.get_all_documents()
         return JSONResponse({
             "documents": documents,
@@ -216,14 +225,12 @@ def list_documents():
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving documents: {str(e)}")
-    finally:
-        if elasticsearch_store:
-            elasticsearch_store.close()
 
 @app.delete("/documents/{file_id}")
 def delete_document(
     file_id: str,
-    vector_store: VectorStore = Depends(get_vector_store_dependency)
+    vector_store: VectorStore = Depends(get_vector_store_dependency),
+    elasticsearch_store: ElasticsearchStore = Depends(get_elasticsearch_store)
 ):
     """
     Delete a document and all its chunks by file_id.
@@ -235,19 +242,10 @@ def delete_document(
     Returns:
         Status message with deletion results
     """
-    elasticsearch_store = None
-    
     try:
-        # Initialize Elasticsearch store
-        elasticsearch_store = ElasticsearchStore(ELASTICSEARCH_URL)
-        
-        # Delete from Weaviate
         weaviate_deleted = vector_store.delete_document(file_id)
-        
-        # Delete from Elasticsearch
         elasticsearch_deleted = elasticsearch_store.delete_document(file_id)
         
-        # Check if document existed
         if weaviate_deleted == 0 and elasticsearch_deleted == 0:
             raise HTTPException(
                 status_code=404, 
@@ -261,14 +259,10 @@ def delete_document(
             "elasticsearch_chunks_deleted": elasticsearch_deleted,
             "message": f"Document '{file_id}' deleted successfully"
         })
-    
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting document: {str(e)}")
-    finally:
-        if elasticsearch_store:
-            elasticsearch_store.close()
 
 @app.post("/search")
 def search_documents(
@@ -289,29 +283,27 @@ def search_documents(
         raise HTTPException(status_code=500, detail=f"Error searching: {str(e)}")
 
 @app.post("/search/keywords")
-def search_by_keywords(body: SearchRequest = Body(..., description="Keyword search request (JSON body)")):
+def search_by_keywords(
+    body: SearchRequest = Body(..., description="Keyword search request (JSON body)"),
+    elasticsearch_store: ElasticsearchStore = Depends(get_elasticsearch_store)
+):
     """
     Search for documents by keywords using Elasticsearch.
     Accepts JSON body with 'q' (search query) and optional 'limit' (number of results).
     """
     search_query = body.q
     search_limit = body.limit or 5
-    
-    elasticsearch_store = None
     try:
-        elasticsearch_store = ElasticsearchStore(ELASTICSEARCH_URL)
         results = elasticsearch_store.search(search_query, n_results=search_limit)
         return JSONResponse(results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error searching: {str(e)}")
-    finally:
-        if elasticsearch_store:
-            elasticsearch_store.close()
 
 @app.post("/search/double")
 def search_double(
     body: SearchRequest = Body(..., description="Double search request (JSON body)"),
-    vector_store: VectorStore = Depends(get_vector_store_dependency)
+    vector_store: VectorStore = Depends(get_vector_store_dependency),
+    elasticsearch_store: ElasticsearchStore = Depends(get_elasticsearch_store)
 ):
     """
     Search for documents using both Weaviate (semantic search) and Elasticsearch (keyword search).
@@ -320,24 +312,13 @@ def search_double(
     """
     search_query = body.q
     search_limit = body.limit or 5
-    
-    # RRF constant (typically 60)
     RRF_K = 60
-    
-    elasticsearch_store = None
-    
     try:
-        # Search both stores
         weaviate_results = vector_store.search(search_query, n_results=search_limit)
-        
-        elasticsearch_store = ElasticsearchStore(ELASTICSEARCH_URL)
         elasticsearch_results = elasticsearch_store.search(search_query, n_results=search_limit)
-        
-        # Combine results using RRF
         final_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
             weaviate_results, elasticsearch_results, search_limit, RRF_K
         )
-        
         return JSONResponse({
             "objects": final_results,
             "weaviate_count": weaviate_count,
@@ -346,17 +327,14 @@ def search_double(
             "unique_count": len(combined_results),
             "rrf_k": RRF_K
         })
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in double search: {str(e)}")
-    finally:
-        if elasticsearch_store:
-            elasticsearch_store.close()
 
 @app.post("/search/double/context")
 def search_double_with_context(
     body: SearchRequestWithContext = Body(..., description="Double search request with context chunks (JSON body)"),
-    vector_store: VectorStore = Depends(get_vector_store_dependency)
+    vector_store: VectorStore = Depends(get_vector_store_dependency),
+    elasticsearch_store: ElasticsearchStore = Depends(get_elasticsearch_store)
 ):
     """
     Search for documents using both Weaviate (semantic search) and Elasticsearch (keyword search).
@@ -375,24 +353,13 @@ def search_double_with_context(
     search_query = body.q
     search_limit = body.limit or 5
     context_chunks = body.context_chunks or 5
-    
-    # RRF constant (typically 60)
     RRF_K = 60
-    
-    elasticsearch_store = None
-    
     try:
-        # Search both stores
         weaviate_results = vector_store.search(search_query, n_results=search_limit)
-        
-        elasticsearch_store = ElasticsearchStore(ELASTICSEARCH_URL)
         elasticsearch_results = elasticsearch_store.search(search_query, n_results=search_limit)
-        
-        # Combine results using RRF
         final_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
             weaviate_results, elasticsearch_results, search_limit, RRF_K
         )
-        
         # Group results by document (file_id)
         documents = {}
         for result in final_results:
@@ -468,12 +435,8 @@ def search_double_with_context(
             "rrf_k": RRF_K,
             "context_chunks": context_chunks
         })
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in double search with context: {str(e)}")
-    finally:
-        if elasticsearch_store:
-            elasticsearch_store.close()
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,6 +1,6 @@
 import re
 from typing import List, Dict, Tuple, Any
-from PyPDF2 import PdfReader
+import fitz  # PyMuPDF
 
 def _normalize_pdf_text(text: str) -> str:
     """
@@ -195,7 +195,6 @@ def _chunk_text(text: str, chunk_size: int, chunk_overlap: int = 500) -> List[st
     return chunks
 
 
-
 def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: int = 300) -> List[Dict[str, Any]]:
     """
     Extract text from PDF and split into chunks with page numbers.
@@ -212,24 +211,25 @@ def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: 
         Exception: If PDF cannot be read or is encrypted
     """
     try:
-        reader = PdfReader(file_path)
+        doc = fitz.open(file_path)
 
-        if reader.is_encrypted:
-            try:
-                reader.decrypt("")
-            except Exception as e:
-                raise Exception(f"PDF is encrypted and cannot be decrypted: {str(e)}")
+        if doc.is_encrypted:
+            if not doc.authenticate(""):
+                doc.close()
+                raise Exception("PDF is encrypted and cannot be decrypted with empty password")
 
-        if len(reader.pages) == 0:
+        if doc.page_count == 0:
+            doc.close()
             raise Exception("PDF has no pages")
 
         # Extract text from each page, keeping track of page numbers
         text_blocks: List[Tuple[str, int]] = []
         pages_with_text = 0
 
-        for i, page in enumerate(reader.pages):
+        for i in range(doc.page_count):
             try:
-                page_text = page.extract_text() or ""
+                page = doc.load_page(i)
+                page_text = page.get_text() or ""
                 if page_text.strip():
                     # Page numbers are 1-indexed for user display
                     text_blocks.append((page_text, i + 1))
@@ -238,11 +238,14 @@ def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: 
                 # skip problematic pages
                 continue
 
+        page_count = doc.page_count
+        doc.close()
+
         if not text_blocks:
             raise Exception(
                 f"No text could be extracted from the PDF. "
                 f"This may be an image-based (scanned) PDF. "
-                f"Processed {len(reader.pages)} pages, found text on {pages_with_text} pages."
+                f"Processed {page_count} pages, found text on {pages_with_text} pages."
             )
 
         # Chunk each page separately and combine with page numbers
