@@ -11,7 +11,7 @@ def _get_cross_encoder() -> CrossEncoder:
     return _cross_encoder
 
 
-def rerank(query: str, results: list, top_n: int) -> list:
+def rerank_cross_encoder(query: str, results: list, top_n: int) -> list:
     """
     Rerank results using a cross-encoder model.
 

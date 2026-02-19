@@ -15,4 +15,5 @@ chroma_db/
 uploads/
 *.log
 rag2/*
-
+tests/*
+tests/

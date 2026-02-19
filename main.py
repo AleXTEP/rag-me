@@ -1,15 +1,17 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Depends
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import Optional
 import os
 import uuid
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Depends
+from fastapi.responses import JSONResponse
 
 from config import UPLOAD_DIR, WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL
 from tasks import process_pdf_task
 from stores import get_store, close_all, WeaviateStore, ElasticsearchStore
-from reranker import rerank
+from reranker import rerank_cross_encoder
+from schemas import SearchRequest, SearchRequestWithContext
+from fusion import combine_search_results_with_rrf
+from deps import get_weaviate_store, get_elasticsearch_store
 
 
 @asynccontextmanager
@@ -24,107 +26,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="RAG System API", version="1.0.0", lifespan=lifespan)
 
-
-def get_weaviate_store() -> WeaviateStore:
-    return get_store("weaviate", weaviate_url=WEAVIATE_URL, embedding_model=EMBEDDING_MODEL)
-
-
-def get_elasticsearch_store() -> ElasticsearchStore:
-    return get_store("elasticsearch", elasticsearch_url=ELASTICSEARCH_URL)
-
-
-def combine_search_results_with_rrf(weaviate_results: dict, elasticsearch_results: dict, search_limit: int, rrf_k: int = 60):
-    """
-    Combine Weaviate and Elasticsearch search results using Reciprocal Rank Fusion (RRF) algorithm.
-
-    Args:
-        weaviate_results: Results from Weaviate search
-        elasticsearch_results: Results from Elasticsearch search
-        search_limit: Maximum number of results to return
-        rrf_k: RRF constant (default 60)
-
-    Returns:
-        Tuple of (final_results, combined_results, weaviate_count, elasticsearch_count)
-    """
-    # Track ranks for each result in each source
-    # Key: (file_id, chunk_index), Value: dict with result data and ranks
-    combined_results = {}
-
-    # Process Weaviate results with ranks (1-indexed)
-    for rank, obj in enumerate(weaviate_results.get("objects", []), start=1):
-        key = (obj.get("file_id"), obj.get("chunk_index"))
-        if key not in combined_results:
-            combined_results[key] = {
-                **obj,
-                "sources": ["weaviate"],
-                "weaviate_rank": rank,
-                "elasticsearch_rank": None
-            }
-        else:
-            # Update existing result with Weaviate rank
-            combined_results[key]["weaviate_rank"] = rank
-            if "weaviate" not in combined_results[key]["sources"]:
-                combined_results[key]["sources"].append("weaviate")
-            # Preserve Weaviate-specific metadata
-            if "distance" in obj:
-                combined_results[key]["distance"] = obj["distance"]
-
-    # Process Elasticsearch results with ranks (1-indexed)
-    for rank, obj in enumerate(elasticsearch_results.get("objects", []), start=1):
-        key = (obj.get("file_id"), obj.get("chunk_index"))
-        if key not in combined_results:
-            combined_results[key] = {
-                **obj,
-                "sources": ["elasticsearch"],
-                "weaviate_rank": None,
-                "elasticsearch_rank": rank
-            }
-        else:
-            # Update existing result with Elasticsearch rank
-            combined_results[key]["elasticsearch_rank"] = rank
-            if "elasticsearch" not in combined_results[key]["sources"]:
-                combined_results[key]["sources"].append("elasticsearch")
-            # Preserve Elasticsearch-specific metadata
-            if "score" in obj:
-                combined_results[key]["score"] = obj["score"]
-            if "highlight" in obj:
-                combined_results[key]["highlight"] = obj["highlight"]
-
-    # Calculate RRF scores for each result
-    # RRF_score = sum(1 / (k + rank)) for each source where result appears
-    for key, result in combined_results.items():
-        rrf_score = 0.0
-
-        # Add contribution from Weaviate rank if present
-        if result.get("weaviate_rank") is not None:
-            rrf_score += 1.0 / (rrf_k + result["weaviate_rank"])
-
-        # Add contribution from Elasticsearch rank if present
-        if result.get("elasticsearch_rank") is not None:
-            rrf_score += 1.0 / (rrf_k + result["elasticsearch_rank"])
-
-        result["rrf_score"] = rrf_score
-
-    # Convert to list and sort by RRF score (descending)
-    final_results = list(combined_results.values())
-    final_results.sort(key=lambda x: x.get("rrf_score", 0.0), reverse=True)
-
-    # Limit to requested number of results
-    final_results = final_results[:search_limit]
-
-    weaviate_count = len(weaviate_results.get("objects", []))
-    elasticsearch_count = len(elasticsearch_results.get("objects", []))
-
-    return final_results, combined_results, weaviate_count, elasticsearch_count
-
-class SearchRequest(BaseModel):
-    q: str = Field(..., description="Search query")
-    limit: Optional[int] = Field(5, ge=1, le=50, description="Number of results to return")
-
-class SearchRequestWithContext(BaseModel):
-    q: str = Field(..., description="Search query")
-    limit: Optional[int] = Field(5, ge=1, le=50, description="Number of results to return")
-    context_chunks: Optional[int] = Field(5, ge=0, le=20, description="Number of chunks before and after each result to include")
 
 @app.get("/")
 def root():
@@ -328,7 +229,7 @@ def search_double(
         rrf_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
             weaviate_results, elasticsearch_results, fetch_limit, RRF_K
         )
-        final_results = rerank(search_query, rrf_results, top_n=search_limit)
+        final_results = rerank_cross_encoder(search_query, rrf_results, top_n=search_limit)
         return JSONResponse({
             "objects": final_results,
             "weaviate_count": weaviate_count,
@@ -348,7 +249,7 @@ def search_double_with_context(
 ):
     """
     Search for documents using both Weaviate (semantic search) and Elasticsearch (keyword search).
-    Combines results using Reciprocal Rank Fusion (RRF) algorithm.
+    Combines results using Reciprocal Rank Fusion (RRF) algorithm and cross-encoder reranker.
 
     Groups results by document, then for each document:
     - Collects all selected chunk indices
@@ -363,7 +264,7 @@ def search_double_with_context(
     search_query = body.q
     search_limit = body.limit or 5
     fetch_limit = search_limit * 4
-    context_chunks = body.context_chunks or 5
+    context_chunks = body.context_chunks or 3
     RRF_K = 60
     try:
         weaviate_results = vector_store.search(search_query, n_results=fetch_limit)
@@ -371,7 +272,7 @@ def search_double_with_context(
         rrf_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
             weaviate_results, elasticsearch_results, fetch_limit, RRF_K
         )
-        final_results = rerank(search_query, rrf_results, top_n=search_limit)
+        final_results = rerank_cross_encoder(search_query, rrf_results, top_n=search_limit)
         # Group results by document (file_id)
         documents = {}
         for result in final_results:

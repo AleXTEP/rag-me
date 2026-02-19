@@ -30,6 +30,6 @@ if [ ! -z "$TASK_ID" ]; then
     echo "File ID: $FILE_ID"
     echo ""
     echo "To check task status, run:"
-    echo "  ./test_task_status.sh $TASK_ID"
+    echo "  ./tests/test_task_status.sh $TASK_ID"
 fi
 

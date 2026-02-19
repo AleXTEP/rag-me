@@ -2,6 +2,14 @@
 
 ## Quick Start
 
+python3 -c "
+from pdf_processor import extract_text_from_pdf
+chunks = extract_text_from_pdf('tests/attention2.pdf', chunk_size=500)
+[print(x, "\n\n") for x in chunks]
+"
+
+
+
 1. **Make scripts executable:**
    ```bash
    chmod +x test_*.sh

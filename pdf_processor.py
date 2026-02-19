@@ -43,12 +43,11 @@ def _normalize_pdf_text(text: str) -> str:
         if i + 1 < len(lines):
             nxt = lines[i + 1].strip()
 
-            # Keep newline if current looks like a heading or list item
-            is_heading = (len(line) < 80 and line.isupper())
+            # Keep newline if current or next looks like a list item
             is_list = bool(re.match(r"^(\-|\*|\u2022|\d+[\.\)]|[a-zA-Z][\.\)])\s+", line))
             next_is_list = bool(re.match(r"^(\-|\*|\u2022|\d+[\.\)]|[a-zA-Z][\.\)])\s+", nxt))
 
-            if nxt != "" and not is_heading and not is_list and not next_is_list:
+            if nxt != "" and not is_list and not next_is_list:
                 # Merge if line doesn't end a sentence strongly (but still merge often in PDFs)
                 # Also avoid merging if line ends with hyphenated word break: "exam-\nple" -> "example"
                 if line.endswith("-") and nxt and nxt[0].islower():
@@ -278,7 +277,60 @@ def _detect_and_remove_headers_footers(
     return cleaned
 
 
-def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: int = 300) -> List[Dict[str, Any]]:
+def _split_large_chunk(text: str, max_size: int) -> List[str]:
+    """
+    Split an oversized chunk at sentence boundaries to stay near max_size.
+    """
+    if len(text) <= max_size:
+        return [text]
+    sentences = _split_sentences(text)
+    result: List[str] = []
+    buf = ""
+    for s in sentences:
+        if not buf:
+            buf = s
+        elif len(buf) + 1 + len(s) <= max_size:
+            buf = buf + " " + s
+        else:
+            result.append(buf)
+            buf = s
+    if buf:
+        result.append(buf)
+    return result
+
+
+def _semantic_chunk_text(text: str, embedding_model: str, max_chunk_size: int = 1500) -> List[str]:
+    """
+    Split text into chunks at topic boundaries using embedding similarity.
+    Uses SemanticChunker from langchain-experimental.
+    Chunks exceeding max_chunk_size are further split at sentence boundaries.
+    """
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_experimental.text_splitter import SemanticChunker
+
+    embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
+    chunker = SemanticChunker(
+        embeddings,
+        breakpoint_threshold_type="percentile",
+        breakpoint_threshold_amount=90,
+        buffer_size=3,
+        min_chunk_size=300,
+    )
+    raw = chunker.split_text(text)
+    # Post-split oversized chunks at sentence boundaries
+    result: List[str] = []
+    for chunk in raw:
+        result.extend(_split_large_chunk(chunk, max_chunk_size))
+    return result
+
+
+def extract_text_from_pdf(
+    file_path: str,
+    chunk_size: int = 2200,
+    chunk_overlap: int = 400,
+    chunking_strategy: str = "fixed",
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+) -> List[Dict[str, Any]]:
     """
     Extract text from PDF and split into chunks with page numbers.
     Concatenates all pages for cross-page chunking.
@@ -305,6 +357,14 @@ def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: 
         doc.close()
         raise Exception("PDF has no pages")
 
+    # Detect browser-generated PDFs and use sort=True for correct reading order
+    meta = doc.metadata or {}
+    producer = (meta.get("producer") or "").lower()
+    creator = (meta.get("creator") or "").lower()
+    browser_hints = ["safari", "chrome", "chromium", "firefox", "mozilla", "webkit",
+                     "wkhtmltopdf", "quartz pdfcontext", "headless"]
+    use_sort = any(hint in producer or hint in creator for hint in browser_hints)
+
     # Step 1: Extract all pages as (raw_text, page_number) tuples
     text_blocks: List[Tuple[str, int]] = []
     pages_with_text = 0
@@ -312,7 +372,7 @@ def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: 
     for i in range(doc.page_count):
         try:
             page = doc.load_page(i)
-            page_text = page.get_text() or ""
+            page_text = page.get_text(sort=use_sort) or ""
             if page_text.strip():
                 text_blocks.append((page_text, i + 1))
                 pages_with_text += 1
@@ -364,8 +424,11 @@ def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: 
         end = len(full_text)
         page_offsets.append((start, end, page_num))
 
-    # Step 5: Chunk the full document (without overlap — sized at content_budget)
-    raw_chunks = _chunk_text(full_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    # Step 5: Chunk the full document
+    if chunking_strategy == "semantic":
+        raw_chunks = _semantic_chunk_text(full_text, embedding_model)
+    else:
+        raw_chunks = _chunk_text(full_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
     if not raw_chunks:
         return [{"text": full_text, "page_number": normalized_pages[0][1], "page_numbers": [normalized_pages[0][1]]}]
@@ -388,8 +451,11 @@ def extract_text_from_pdf(file_path: str, chunk_size: int = 800, chunk_overlap: 
         else:
             chunk_page_mappings.append(pages_for_chunk)
 
-    # Step 7: Apply overlap
-    final_chunks = _apply_overlap(raw_chunks, chunk_overlap, chunk_size)
+    # Step 7: Apply overlap (only for fixed chunking)
+    if chunking_strategy == "semantic":
+        final_chunks = raw_chunks
+    else:
+        final_chunks = _apply_overlap(raw_chunks, chunk_overlap, chunk_size)
 
     # Step 8: Build result — collapse newlines in non-table text
     all_chunks = []

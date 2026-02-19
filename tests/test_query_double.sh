@@ -14,7 +14,7 @@ echo "Searching for: '$QUERY'"
 echo "Limit: $LIMIT results"
 echo ""
 
-RESPONSE=$(curl -s -X POST "http://localhost:8000/search/double" \
+RESPONSE=$(curl -s -X POST "http://localhost:8000/search/double/context" \
     -H "Content-Type: application/json" \
     -d "{\"q\": \"$QUERY\", \"limit\": $LIMIT}")
 

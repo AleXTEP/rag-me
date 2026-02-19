@@ -1,6 +1,6 @@
 import os
 from celery_app import celery_app
-from config import WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, UPLOAD_DIR
+from config import WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, UPLOAD_DIR, CHUNKING_STRATEGY
 from pdf_processor import extract_text_from_pdf
 from stores import get_store
 
@@ -20,7 +20,11 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
     try:
         # Extract text from PDF
         try:
-            text_chunks = extract_text_from_pdf(file_path)
+            text_chunks = extract_text_from_pdf(
+                file_path,
+                chunking_strategy=CHUNKING_STRATEGY,
+                embedding_model=EMBEDDING_MODEL,
+            )
         except Exception as e:
             # Provide detailed error message
             error_msg = str(e)
