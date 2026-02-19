@@ -1,47 +1,55 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import Optional, Generator
+from typing import Optional
 import os
 import uuid
+
 from config import UPLOAD_DIR, WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL
 from tasks import process_pdf_task
-from vector_store import VectorStore, get_vector_store
-from elasticsearch_store import ElasticsearchStore
-
-app = FastAPI(title="RAG System API", version="1.0.0")
-
-# FastAPI dependency for VectorStore singleton
-def get_vector_store_dependency() -> VectorStore:
-    """FastAPI dependency that returns a singleton VectorStore instance."""
-    return get_vector_store(WEAVIATE_URL, EMBEDDING_MODEL)
+from stores import get_store, close_all, WeaviateStore, ElasticsearchStore
+from reranker import rerank
 
 
-def get_elasticsearch_store() -> Generator[ElasticsearchStore, None, None]:
-    """FastAPI dependency that provides an ElasticsearchStore and closes it after the request."""
-    store = ElasticsearchStore(ELASTICSEARCH_URL)
-    try:
-        yield store
-    finally:
-        store.close()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: initialize both store singletons
+    get_store("weaviate", weaviate_url=WEAVIATE_URL, embedding_model=EMBEDDING_MODEL)
+    get_store("elasticsearch", elasticsearch_url=ELASTICSEARCH_URL)
+    yield
+    # Shutdown: close all connections
+    close_all()
+
+
+app = FastAPI(title="RAG System API", version="1.0.0", lifespan=lifespan)
+
+
+def get_weaviate_store() -> WeaviateStore:
+    return get_store("weaviate", weaviate_url=WEAVIATE_URL, embedding_model=EMBEDDING_MODEL)
+
+
+def get_elasticsearch_store() -> ElasticsearchStore:
+    return get_store("elasticsearch", elasticsearch_url=ELASTICSEARCH_URL)
+
 
 def combine_search_results_with_rrf(weaviate_results: dict, elasticsearch_results: dict, search_limit: int, rrf_k: int = 60):
     """
     Combine Weaviate and Elasticsearch search results using Reciprocal Rank Fusion (RRF) algorithm.
-    
+
     Args:
         weaviate_results: Results from Weaviate search
         elasticsearch_results: Results from Elasticsearch search
         search_limit: Maximum number of results to return
         rrf_k: RRF constant (default 60)
-    
+
     Returns:
         Tuple of (final_results, combined_results, weaviate_count, elasticsearch_count)
     """
     # Track ranks for each result in each source
     # Key: (file_id, chunk_index), Value: dict with result data and ranks
     combined_results = {}
-    
+
     # Process Weaviate results with ranks (1-indexed)
     for rank, obj in enumerate(weaviate_results.get("objects", []), start=1):
         key = (obj.get("file_id"), obj.get("chunk_index"))
@@ -60,7 +68,7 @@ def combine_search_results_with_rrf(weaviate_results: dict, elasticsearch_result
             # Preserve Weaviate-specific metadata
             if "distance" in obj:
                 combined_results[key]["distance"] = obj["distance"]
-    
+
     # Process Elasticsearch results with ranks (1-indexed)
     for rank, obj in enumerate(elasticsearch_results.get("objects", []), start=1):
         key = (obj.get("file_id"), obj.get("chunk_index"))
@@ -81,32 +89,32 @@ def combine_search_results_with_rrf(weaviate_results: dict, elasticsearch_result
                 combined_results[key]["score"] = obj["score"]
             if "highlight" in obj:
                 combined_results[key]["highlight"] = obj["highlight"]
-    
+
     # Calculate RRF scores for each result
     # RRF_score = sum(1 / (k + rank)) for each source where result appears
     for key, result in combined_results.items():
         rrf_score = 0.0
-        
+
         # Add contribution from Weaviate rank if present
         if result.get("weaviate_rank") is not None:
             rrf_score += 1.0 / (rrf_k + result["weaviate_rank"])
-        
+
         # Add contribution from Elasticsearch rank if present
         if result.get("elasticsearch_rank") is not None:
             rrf_score += 1.0 / (rrf_k + result["elasticsearch_rank"])
-        
+
         result["rrf_score"] = rrf_score
-    
+
     # Convert to list and sort by RRF score (descending)
     final_results = list(combined_results.values())
     final_results.sort(key=lambda x: x.get("rrf_score", 0.0), reverse=True)
-    
+
     # Limit to requested number of results
     final_results = final_results[:search_limit]
-    
+
     weaviate_count = len(weaviate_results.get("objects", []))
     elasticsearch_count = len(elasticsearch_results.get("objects", []))
-    
+
     return final_results, combined_results, weaviate_count, elasticsearch_count
 
 class SearchRequest(BaseModel):
@@ -129,7 +137,7 @@ def health():
 @app.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
-    vector_store: VectorStore = Depends(get_vector_store_dependency)
+    vector_store: WeaviateStore = Depends(get_weaviate_store)
 ):
     """
     Upload a PDF file for processing.
@@ -138,31 +146,31 @@ async def upload_file(
     # Validate file type
     if file.filename and not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
-    
+
     # Check if filename already exists
     original_filename = file.filename or ""
     if original_filename:
         if vector_store.filename_exists(original_filename):
             raise HTTPException(
-                status_code=409, 
+                status_code=409,
                 detail=f"File with filename '{original_filename}' already exists in the system"
             )
-    
+
     # Generate unique file ID
     file_id = str(uuid.uuid4())
     file_extension = os.path.splitext(file.filename or "")[1]
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}{file_extension}")
-    
+
     try:
         # Save uploaded file
         with open(file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
-        
+
         # Queue task for processing
         original_filename = file.filename or f"{file_id}{file_extension}"
         task = process_pdf_task.delay(file_path, file_id, original_filename)
-        
+
         return JSONResponse({
             "status": "queued",
             "file_id": file_id,
@@ -170,7 +178,7 @@ async def upload_file(
             "filename": file.filename,
             "message": "File uploaded and queued for processing"
         })
-    
+
     except Exception as e:
         # Clean up on error
         if os.path.exists(file_path):
@@ -184,7 +192,7 @@ def get_task_status(task_id: str):
     """
     from celery_app import celery_app
     task = celery_app.AsyncResult(task_id)
-    
+
     if task.state == 'PENDING':
         response = {
             'state': task.state,
@@ -205,7 +213,7 @@ def get_task_status(task_id: str):
             'state': task.state,
             'error': str(task.info) if task.info else 'Unknown error'
         }
-    
+
     return response
 
 @app.get("/documents")
@@ -229,29 +237,29 @@ def list_documents(
 @app.delete("/documents/{file_id}")
 def delete_document(
     file_id: str,
-    vector_store: VectorStore = Depends(get_vector_store_dependency),
+    vector_store: WeaviateStore = Depends(get_weaviate_store),
     elasticsearch_store: ElasticsearchStore = Depends(get_elasticsearch_store)
 ):
     """
     Delete a document and all its chunks by file_id.
     Removes the document from both Weaviate (vector store) and Elasticsearch.
-    
+
     Args:
         file_id: Unique identifier for the document to delete
-    
+
     Returns:
         Status message with deletion results
     """
     try:
         weaviate_deleted = vector_store.delete_document(file_id)
         elasticsearch_deleted = elasticsearch_store.delete_document(file_id)
-        
+
         if weaviate_deleted == 0 and elasticsearch_deleted == 0:
             raise HTTPException(
-                status_code=404, 
+                status_code=404,
                 detail=f"Document with file_id '{file_id}' not found"
             )
-        
+
         return JSONResponse({
             "status": "success",
             "file_id": file_id,
@@ -267,7 +275,7 @@ def delete_document(
 @app.post("/search")
 def search_documents(
     body: SearchRequest = Body(..., description="Search request (JSON body)"),
-    vector_store: VectorStore = Depends(get_vector_store_dependency)
+    vector_store: WeaviateStore = Depends(get_weaviate_store)
 ):
     """
     Search for similar documents using semantic search.
@@ -275,7 +283,7 @@ def search_documents(
     """
     search_query = body.q
     search_limit = body.limit or 5
-    
+
     try:
         results = vector_store.search(search_query, n_results=search_limit)
         return JSONResponse(results)
@@ -302,7 +310,7 @@ def search_by_keywords(
 @app.post("/search/double")
 def search_double(
     body: SearchRequest = Body(..., description="Double search request (JSON body)"),
-    vector_store: VectorStore = Depends(get_vector_store_dependency),
+    vector_store: WeaviateStore = Depends(get_weaviate_store),
     elasticsearch_store: ElasticsearchStore = Depends(get_elasticsearch_store)
 ):
     """
@@ -312,13 +320,15 @@ def search_double(
     """
     search_query = body.q
     search_limit = body.limit or 5
+    fetch_limit = search_limit * 4
     RRF_K = 60
     try:
-        weaviate_results = vector_store.search(search_query, n_results=search_limit)
-        elasticsearch_results = elasticsearch_store.search(search_query, n_results=search_limit)
-        final_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
-            weaviate_results, elasticsearch_results, search_limit, RRF_K
+        weaviate_results = vector_store.search(search_query, n_results=fetch_limit)
+        elasticsearch_results = elasticsearch_store.search(search_query, n_results=fetch_limit)
+        rrf_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
+            weaviate_results, elasticsearch_results, fetch_limit, RRF_K
         )
+        final_results = rerank(search_query, rrf_results, top_n=search_limit)
         return JSONResponse({
             "objects": final_results,
             "weaviate_count": weaviate_count,
@@ -333,39 +343,41 @@ def search_double(
 @app.post("/search/double/context")
 def search_double_with_context(
     body: SearchRequestWithContext = Body(..., description="Double search request with context chunks (JSON body)"),
-    vector_store: VectorStore = Depends(get_vector_store_dependency),
+    vector_store: WeaviateStore = Depends(get_weaviate_store),
     elasticsearch_store: ElasticsearchStore = Depends(get_elasticsearch_store)
 ):
     """
     Search for documents using both Weaviate (semantic search) and Elasticsearch (keyword search).
     Combines results using Reciprocal Rank Fusion (RRF) algorithm.
-    
+
     Groups results by document, then for each document:
     - Collects all selected chunk indices
     - Extends each selected chunk with N chunks before and N chunks after
     - Merges all chunk ranges without duplicates
     - Retrieves all chunks for the document and joins the text
-    
+
     Returns results grouped by document with augmented chunk ranges.
     Accepts JSON body with 'q' (search query), optional 'limit' (number of results per source),
     and optional 'context_chunks' (number of chunks before/after each selected chunk, default 5).
     """
     search_query = body.q
     search_limit = body.limit or 5
+    fetch_limit = search_limit * 4
     context_chunks = body.context_chunks or 5
     RRF_K = 60
     try:
-        weaviate_results = vector_store.search(search_query, n_results=search_limit)
-        elasticsearch_results = elasticsearch_store.search(search_query, n_results=search_limit)
-        final_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
-            weaviate_results, elasticsearch_results, search_limit, RRF_K
+        weaviate_results = vector_store.search(search_query, n_results=fetch_limit)
+        elasticsearch_results = elasticsearch_store.search(search_query, n_results=fetch_limit)
+        rrf_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
+            weaviate_results, elasticsearch_results, fetch_limit, RRF_K
         )
+        final_results = rerank(search_query, rrf_results, top_n=search_limit)
         # Group results by document (file_id)
         documents = {}
         for result in final_results:
             file_id = result.get("file_id")
             chunk_index = result.get("chunk_index")
-            
+
             if file_id not in documents:
                 documents[file_id] = {
                     "file_id": file_id,
@@ -374,16 +386,16 @@ def search_double_with_context(
                     "selected_chunk_indices": [],
                     "results": []
                 }
-            
+
             documents[file_id]["selected_chunk_indices"].append(chunk_index)
             documents[file_id]["results"].append(result)
-        
+
         # For each document, calculate merged chunk ranges
         documents_with_context = []
         for file_id, doc_data in documents.items():
             selected_indices = sorted(set(doc_data["selected_chunk_indices"]))
             chunk_count = doc_data["chunk_count"]
-            
+
             # Calculate chunk ranges for each selected chunk and merge them
             all_chunk_indices = set()
             for chunk_index in selected_indices:
@@ -393,23 +405,23 @@ def search_double_with_context(
                     end_idx = min(chunk_count - 1, chunk_index + context_chunks)
                 else:
                     end_idx = chunk_index + context_chunks
-                
+
                 # Add all indices in this range
                 for idx in range(start_idx, end_idx + 1):
                     all_chunk_indices.add(idx)
-            
+
             # Convert to sorted list
             augmented_chunk_indices = sorted(all_chunk_indices)
-            
+
             # Retrieve all chunks for this document in one go
             all_chunks = elasticsearch_store.get_chunks_by_range(file_id, augmented_chunk_indices)
-            
+
             # Sort by chunk_index (should already be sorted, but ensure it)
             all_chunks.sort(key=lambda x: x["chunk_index"])
-            
+
             # Join text from all chunks
             joined_text = "\n".join([chunk["text"] for chunk in all_chunks])
-            
+
             # Create document result
             document_result = {
                 "file_id": file_id,
@@ -424,7 +436,7 @@ def search_double_with_context(
                 "results": doc_data["results"]  # Original search results for this document
             }
             documents_with_context.append(document_result)
-        
+
         return JSONResponse({
             "documents": documents_with_context,
             "document_count": len(documents_with_context),
@@ -441,4 +453,3 @@ def search_double_with_context(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

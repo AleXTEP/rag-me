@@ -1,15 +1,12 @@
-from elasticsearch import Elasticsearch
-from typing import List, Dict, Optional
-import uuid
+from typing import List, Optional
 
-class ElasticsearchStore:
+from elasticsearch import Elasticsearch
+
+from stores.base import BaseStore
+
+
+class ElasticsearchStore(BaseStore):
     def __init__(self, elasticsearch_url: str):
-        """
-        Initialize Elasticsearch store for keyword search.
-        
-        Args:
-            elasticsearch_url: URL to Elasticsearch instance (e.g., http://localhost:9200)
-        """
         self.client = Elasticsearch(
             [elasticsearch_url],
             request_timeout=30,
@@ -18,11 +15,9 @@ class ElasticsearchStore:
         )
         self.index_name = "documents"
         self._ensure_index()
-    
+
     def _ensure_index(self):
-        """Create index with mapping if it doesn't exist."""
         if not self.client.indices.exists(index=self.index_name):
-            # Define mapping for better search performance
             mapping = {
                 "mappings": {
                     "properties": {
@@ -53,19 +48,9 @@ class ElasticsearchStore:
                     }
                 }
             }
-            # Elasticsearch 8.x uses mappings parameter directly
             self.client.indices.create(index=self.index_name, mappings=mapping["mappings"])
-    
+
     def add_documents(self, file_id: str, text_chunks: List, filename: str = ""):
-        """
-        Add documents to Elasticsearch.
-        
-        Args:
-            file_id: Unique identifier for the file
-            text_chunks: List of text chunks (dicts with 'text' and 'page_number' keys, or strings for backward compatibility)
-            filename: Original filename of the document
-        """
-        # Extract text from chunks (handle both dict and string formats)
         chunk_texts = []
         chunk_pages = []
         for chunk in text_chunks:
@@ -73,14 +58,12 @@ class ElasticsearchStore:
                 chunk_texts.append(chunk["text"])
                 chunk_pages.append(chunk.get("page_number", 1))
             else:
-                # Backward compatibility: treat as string
                 chunk_texts.append(chunk)
                 chunk_pages.append(1)
-        
+
         chunk_count = len(chunk_texts)
         page_count = len(set(chunk_pages))
-        
-        # Prepare bulk operations
+
         actions = []
         for i, (chunk_text, page_num) in enumerate(zip(chunk_texts, chunk_pages)):
             doc = {
@@ -97,30 +80,13 @@ class ElasticsearchStore:
                 }
             }
             actions.append(doc)
-        
-        # Bulk index documents
+
         if actions:
             from elasticsearch.helpers import bulk
             bulk(self.client, actions)
-            # Refresh index to make documents searchable immediately
             self.client.indices.refresh(index=self.index_name)
-    
+
     def search(self, query: str, n_results: int = 5, filename: Optional[str] = None):
-        """
-        Search for documents by keywords.
-        Prioritizes chunks that contain the exact phrase (e.g. "type confusion"
-        together) over chunks where the words appear in different parts.
-
-        Args:
-            query: Search query (keywords or phrase)
-            n_results: Number of results to return
-            filename: Optional filename filter
-
-        Returns:
-            Search results
-        """
-        # Build bool with should: phrase match (boosted) + multi_match (keywords)
-        # Phrase match ranks higher when words appear together in order
         bool_query = {
             "should": [
                 {
@@ -149,20 +115,17 @@ class ElasticsearchStore:
             "_source": ["file_id", "filename", "chunk_index", "chunk_count", "page_number", "text"]
         }
 
-        # Add filename filter if provided
         if filename:
             bool_query["filter"] = [
                 {"term": {"filename.keyword": filename}}
             ]
-        
-        # Execute search
+
         response = self.client.search(index=self.index_name, body=search_body)
-        
-        # Format results
+
         formatted_results = {
             "objects": []
         }
-        
+
         for hit in response["hits"]["hits"]:
             source = hit["_source"]
             result = {
@@ -176,22 +139,13 @@ class ElasticsearchStore:
                 "score": hit["_score"]
             }
             formatted_results["objects"].append(result)
-        
+
         return formatted_results
-    
+
     def filename_exists(self, filename: str) -> bool:
-        """
-        Check if a filename already exists in Elasticsearch.
-        
-        Args:
-            filename: Filename to check
-        
-        Returns:
-            True if filename exists, False otherwise
-        """
         if not filename:
             return False
-        
+
         search_body = {
             "query": {
                 "term": {
@@ -200,18 +154,11 @@ class ElasticsearchStore:
             },
             "size": 1
         }
-        
+
         response = self.client.search(index=self.index_name, body=search_body)
         return response["hits"]["total"]["value"] > 0
-    
+
     def get_all_documents(self):
-        """
-        Get a list of all unique documents with their metadata.
-        
-        Returns:
-            List of documents with file_id, filename, and chunk_count
-        """
-        # Use aggregation to get unique documents
         search_body = {
             "size": 0,
             "aggs": {
@@ -232,7 +179,7 @@ class ElasticsearchStore:
                 }
             }
         }
-        
+
         response = self.client.search(index=self.index_name, body=search_body)
         documents = []
         for bucket in response["aggregations"]["unique_docs"]["buckets"]:
@@ -244,20 +191,10 @@ class ElasticsearchStore:
                 "chunk_count": first_chunk.get("chunk_count", 0),
                 "page_count": first_chunk.get("page_count", 0)
             })
-        
+
         return documents
-    
+
     def delete_document(self, file_id: str) -> int:
-        """
-        Delete all chunks for a given document by file_id.
-        
-        Args:
-            file_id: Unique identifier for the file to delete
-        
-        Returns:
-            Number of chunks deleted
-        """
-        # Use delete_by_query to delete all documents with matching file_id
         delete_body = {
             "query": {
                 "term": {
@@ -265,30 +202,19 @@ class ElasticsearchStore:
                 }
             }
         }
-        
+
         response = self.client.delete_by_query(
             index=self.index_name,
             body=delete_body,
-            refresh=True  # Refresh index immediately after deletion
+            refresh=True
         )
-        
+
         return response.get("deleted", 0)
-    
+
     def get_chunks_by_range(self, file_id: str, chunk_indices: List[int]):
-        """
-        Get chunks by file_id and list of chunk indices.
-        
-        Args:
-            file_id: Unique identifier for the file
-            chunk_indices: List of chunk indices to retrieve
-        
-        Returns:
-            List of chunk objects sorted by chunk_index
-        """
         if not chunk_indices:
             return []
-        
-        # Build query to get chunks by file_id and chunk_index
+
         search_body = {
             "query": {
                 "bool": {
@@ -302,10 +228,9 @@ class ElasticsearchStore:
             "_source": ["file_id", "filename", "chunk_index", "chunk_count", "page_number", "text"],
             "sort": [{"chunk_index": {"order": "asc"}}]
         }
-        
+
         response = self.client.search(index=self.index_name, body=search_body)
-        
-        # Format results
+
         chunks = []
         for hit in response["hits"]["hits"]:
             source = hit["_source"]
@@ -316,11 +241,9 @@ class ElasticsearchStore:
                 "filename": source["filename"],
                 "page_number": source.get("page_number", 1)
             })
-        
+
         return chunks
-    
+
     def close(self):
-        """Close the Elasticsearch connection."""
         if self.client:
             self.client.close()
-
