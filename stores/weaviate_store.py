@@ -118,6 +118,32 @@ class WeaviateStore(BaseStore):
 
         return formatted_results
 
+    def hybrid_search(self, query: str, n_results: int = 5, alpha: float = 0.5):
+        collection = self.client.collections.get(self.collection_name)
+        query_embedding = self.embedding_model.encode([query]).tolist()[0]
+        results = collection.query.hybrid(
+            query=query,
+            vector=query_embedding,
+            alpha=alpha,
+            limit=n_results,
+            return_metadata=["score"]
+        )
+        return {
+            "objects": [
+                {
+                    "id": str(obj.uuid),
+                    "text": obj.properties["text"],
+                    "file_id": obj.properties["file_id"],
+                    "filename": obj.properties["filename"],
+                    "chunk_index": obj.properties["chunk_index"],
+                    "chunk_count": obj.properties["chunk_count"],
+                    "page_number": obj.properties.get("page_number", 1),
+                    "score": obj.metadata.score if obj.metadata else None,
+                }
+                for obj in results.objects
+            ]
+        }
+
     def get_all_documents(self):
         collection = self.client.collections.get(self.collection_name)
 

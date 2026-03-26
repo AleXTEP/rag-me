@@ -10,6 +10,13 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
 CHUNKING_STRATEGY = os.getenv("CHUNKING_STRATEGY", "fixed")
+USE_ELASTICSEARCH = os.getenv("USE_ELASTICSEARCH", "true").lower() == "true"
+
+# HyDE (Hypothetical Document Embeddings)
+HYDE_PROVIDER = os.getenv("HYDE_PROVIDER", "claude")   # claude | openai | local
+HYDE_MODEL = os.getenv("HYDE_MODEL", "claude-haiku-4-5-20251001")
+HYDE_API_KEY = os.getenv("HYDE_API_KEY", "")           # falls back to env SDK defaults
+HYDE_LOCAL_URL = os.getenv("HYDE_LOCAL_URL", "http://localhost:11434")
 
 # Create upload directory if it doesn't exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)

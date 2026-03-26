@@ -1,6 +1,6 @@
 import os
 from celery_app import celery_app
-from config import WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, UPLOAD_DIR, CHUNKING_STRATEGY
+from config import WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, UPLOAD_DIR, CHUNKING_STRATEGY, USE_ELASTICSEARCH
 from pdf_processor import extract_text_from_pdf
 from stores import get_store
 
@@ -52,13 +52,11 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
 
         # Get singleton store instances
         vector_store = get_store("weaviate", weaviate_url=WEAVIATE_URL, embedding_model=EMBEDDING_MODEL)
-        elasticsearch_store = get_store("elasticsearch", elasticsearch_url=ELASTICSEARCH_URL)
-
-        # Store embeddings in Weaviate
         vector_store.add_documents(file_id, text_chunks, filename)
 
-        # Store documents in Elasticsearch for keyword search
-        elasticsearch_store.add_documents(file_id, text_chunks, filename)
+        if USE_ELASTICSEARCH:
+            elasticsearch_store = get_store("elasticsearch", elasticsearch_url=ELASTICSEARCH_URL)
+            elasticsearch_store.add_documents(file_id, text_chunks, filename)
 
         # Clean up uploaded file
         if os.path.exists(file_path):

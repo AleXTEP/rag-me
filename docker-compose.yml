@@ -67,6 +67,11 @@ services:
       - RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
       - UPLOAD_DIR=/app/uploads
       - CHUNKING_STRATEGY=fixed
+      - HYDE_PROVIDER=claude
+      - HYDE_MODEL=claude-haiku-4-5-20251001
+      - HYDE_API_KEY=${HYDE_API_KEY:-}
+      - HYDE_LOCAL_URL=http://localhost:11434
+      - USE_ELASTICSEARCH=true
     volumes:
       - .:/app
       - uploads_data:/app/uploads
@@ -92,6 +97,7 @@ services:
       - RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
       - UPLOAD_DIR=/app/uploads
       - CHUNKING_STRATEGY=fixed
+      - USE_ELASTICSEARCH=true
     volumes:
       - .:/app
       - uploads_data:/app/uploads

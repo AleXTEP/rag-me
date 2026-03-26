@@ -10,3 +10,6 @@ elasticsearch==8.11.0
 pymupdf>=1.24.0
 langchain-experimental
 langchain-huggingface
+anthropic
+openai
+httpx
