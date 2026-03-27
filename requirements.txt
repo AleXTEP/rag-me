@@ -13,3 +13,6 @@ langchain-huggingface
 anthropic
 openai
 httpx
+pytesseract
+Pillow
+pdf2image

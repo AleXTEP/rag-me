@@ -1,3 +1,7 @@
+"""
+Rerank results using a cross-encoder model.
+"""
+
 from sentence_transformers import CrossEncoder
 from config import RERANKER_MODEL
 
@@ -14,7 +18,6 @@ def _get_cross_encoder() -> CrossEncoder:
 def rerank_cross_encoder(query: str, results: list, top_n: int) -> list:
     """
     Rerank results using a cross-encoder model.
-
     Args:
         query: The search query
         results: List of result dicts, each must have a "text" key

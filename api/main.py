@@ -7,13 +7,13 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Depends
 from fastapi.responses import JSONResponse
 
 from config import UPLOAD_DIR, WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, USE_ELASTICSEARCH
-from tasks import process_pdf_task
+from ingestion.tasks import process_pdf_task
 from stores import get_store, close_all, WeaviateStore, ElasticsearchStore
-from reranker import rerank_cross_encoder
-from schemas import SearchRequest, SearchRequestWithContext
-from fusion import combine_search_results_with_rrf
-from deps import get_weaviate_store, get_elasticsearch_store
-from hyde import generate_hypothetical_document
+from retrieval.reranker import rerank_cross_encoder
+from api.schemas import SearchRequest, SearchRequestWithContext
+from retrieval.fusion import combine_search_results_with_rrf
+from api.deps import get_weaviate_store, get_elasticsearch_store
+from retrieval.hyde import generate_hypothetical_document
 
 
 print(USE_ELASTICSEARCH, "USE_ELASTICSEARCH")
@@ -85,7 +85,7 @@ async def upload_file(
 
 @app.get("/task/{task_id}")
 def get_task_status(task_id: str):
-    from celery_app import celery_app
+    from worker.celery_app import celery_app
     task = celery_app.AsyncResult(task_id)
 
     if task.state == 'PENDING':
@@ -93,9 +93,24 @@ def get_task_status(task_id: str):
     elif task.state == 'PROGRESS':
         response = {'state': task.state, 'status': task.info.get('status', 'Processing...')}
     elif task.state == 'SUCCESS':
-        response = {'state': task.state, 'result': task.result}
+        result = task.result or {}
+        # Surface application-level errors stored in the result dict
+        if isinstance(result, dict) and result.get('status') == 'error':
+            response = {
+                'state': task.state,
+                'status': 'error',
+                'error': result.get('message', 'Unknown error'),
+            }
+        else:
+            response = {'state': task.state, 'status': 'success', 'result': result}
+    elif task.state == 'FAILURE':
+        response = {
+            'state': task.state,
+            'status': 'error',
+            'error': str(task.info) if task.info else 'Unknown error',
+        }
     else:
-        response = {'state': task.state, 'error': str(task.info) if task.info else 'Unknown error'}
+        response = {'state': task.state, 'status': task.state.lower()}
 
     return response
 

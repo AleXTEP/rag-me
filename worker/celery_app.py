@@ -13,9 +13,8 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    imports=("tasks",),  # Import tasks module so Celery can discover tasks
+    imports=("ingestion.tasks",),  # Import tasks module so Celery can discover tasks
 )
 
 # Import tasks to ensure they're registered
-import tasks  # noqa: F401
-
+import ingestion.tasks  # noqa: F401

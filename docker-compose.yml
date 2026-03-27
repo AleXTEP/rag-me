@@ -83,7 +83,7 @@ services:
       elasticsearch:
         condition: service_healthy
     restart: unless-stopped
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
   celery-worker:
     build:
@@ -109,7 +109,7 @@ services:
       elasticsearch:
         condition: service_healthy
     restart: unless-stopped
-    command: celery -A tasks worker --loglevel=info
+    command: celery -A worker.celery_app worker --loglevel=info
 
 volumes:
   weaviate_data:

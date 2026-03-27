@@ -1,7 +1,7 @@
 import os
-from celery_app import celery_app
+from worker.celery_app import celery_app
 from config import WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, UPLOAD_DIR, CHUNKING_STRATEGY, USE_ELASTICSEARCH
-from pdf_processor import extract_text_from_pdf
+from ingestion.pdf_processor import extract_text_from_pdf
 from stores import get_store
 
 @celery_app.task(name="process_pdf")
@@ -12,7 +12,7 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
     2. Embed the text
     3. Store in vector database
 
-    Args:
+    Args:   
         file_path: Path to the uploaded file
         file_id: Unique identifier for the file
         filename: Original filename of the uploaded file
@@ -50,23 +50,40 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
                 "message": "No text extracted from PDF. The PDF may be image-based (scanned) or corrupted."
             }
 
+        ocr_used = any(chunk.get("ocr_used") for chunk in text_chunks)
+
         # Get singleton store instances
         vector_store = get_store("weaviate", weaviate_url=WEAVIATE_URL, embedding_model=EMBEDDING_MODEL)
-        vector_store.add_documents(file_id, text_chunks, filename)
 
-        if USE_ELASTICSEARCH:
-            elasticsearch_store = get_store("elasticsearch", elasticsearch_url=ELASTICSEARCH_URL)
-            elasticsearch_store.add_documents(file_id, text_chunks, filename)
+        # Insert with compensating rollback: if Elasticsearch fails after Weaviate succeeds, roll back.
+        weaviate_ok = False
+        try:
+            vector_store.add_documents(file_id, text_chunks, filename)
+            weaviate_ok = True
+
+            if USE_ELASTICSEARCH:
+                elasticsearch_store = get_store("elasticsearch", elasticsearch_url=ELASTICSEARCH_URL)
+                elasticsearch_store.add_documents(file_id, text_chunks, filename)
+        except Exception as e:
+            if weaviate_ok:
+                try:
+                    vector_store.delete_document(file_id)
+                except Exception:
+                    pass  # best-effort rollback
+            raise
 
         # Clean up uploaded file
         if os.path.exists(file_path):
             os.remove(file_path)
 
-        return {
+        result = {
             "status": "success",
             "file_id": file_id,
-            "chunks_processed": len(text_chunks)
+            "chunks_processed": len(text_chunks),
         }
+        if ocr_used:
+            result["ocr_used"] = True
+        return result
     except Exception as e:
         # Clean up on error
         if os.path.exists(file_path):

@@ -18,6 +18,11 @@ HYDE_MODEL = os.getenv("HYDE_MODEL", "claude-haiku-4-5-20251001")
 HYDE_API_KEY = os.getenv("HYDE_API_KEY", "")           # falls back to env SDK defaults
 HYDE_LOCAL_URL = os.getenv("HYDE_LOCAL_URL", "http://localhost:11434")
 
+# OCR (fallback for scanned/image-based PDFs)
+OCR_PROVIDER = os.getenv("OCR_PROVIDER", "tesseract")  # tesseract | deepseek | custom
+OCR_API_KEY = os.getenv("OCR_API_KEY", "")
+OCR_API_URL = os.getenv("OCR_API_URL", "")
+
 # Create upload directory if it doesn't exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 

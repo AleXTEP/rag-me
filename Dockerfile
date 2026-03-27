@@ -7,6 +7,8 @@ RUN apt-get update --fix-missing && \
     apt-get install -y --no-install-recommends \
     gcc \
     g++ \
+    tesseract-ocr \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install CPU-only PyTorch first (much smaller than CUDA version)
@@ -32,5 +34,5 @@ RUN mkdir -p /app/uploads
 EXPOSE 8000
 
 # Default command (can be overridden in docker-compose.yml)
-CMD ["python", "main.py"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
 

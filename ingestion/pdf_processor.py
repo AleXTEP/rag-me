@@ -1,7 +1,36 @@
+"""
+PDF Processing Pipeline:
+
+Step 0: Detect browser-generated PDFs and use sort=True for correct reading order.
+
+Get text from PDF:
+1: Extract all pages as (raw_text, page_number) tuples.
+    1a: OCR fallback for scanned/image-based PDFs (if enabled).
+
+Normalize text:
+2: Strip trailing page numbers from each page's raw text.
+3: Header/footer dedup (on raw text before normalization).
+4: Normalize each page text.
+5: Concatenate all pages, tracking character offsets per page.
+
+Chunk text:
+6: Chunk the full document: 
+    - Semantic chunking 
+    - Fixed chunking
+7: Map each raw chunk to page number(s) via offset ranges.
+8: Apply overlap (only for fixed chunking).
+
+Return chunks:
+9: Build result — collapse newlines in non-table text.
+10: Return the chunks.
+"""
+
+
 import re
 from collections import Counter
 from typing import List, Dict, Tuple, Any
 import fitz  # PyMuPDF
+
 
 def _normalize_pdf_text(text: str) -> str:
     """
@@ -330,6 +359,7 @@ def extract_text_from_pdf(
     chunk_overlap: int = 400,
     chunking_strategy: str = "fixed",
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    ocr_fallback: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Extract text from PDF and split into chunks with page numbers.
@@ -341,10 +371,11 @@ def extract_text_from_pdf(
         chunk_overlap: Character overlap between chunks (good for RAG)
 
     Returns:
-        List of dictionaries with 'text', 'page_number', and 'page_numbers' keys
+        List of dictionaries with 'text', 'page_number', 'page_numbers', and optionally
+        'ocr_used' (True when text was obtained via OCR fallback) keys.
 
     Raises:
-        Exception: If PDF cannot be read or is encrypted
+        Exception: If PDF cannot be read, is encrypted, or OCR also fails
     """
     doc = fitz.open(file_path)
 
@@ -382,14 +413,21 @@ def extract_text_from_pdf(
     page_count = doc.page_count
     doc.close()
 
+    ocr_used = False
     if not text_blocks:
-        raise Exception(
-            f"No text could be extracted from the PDF. "
-            f"This may be an image-based (scanned) PDF. "
-            f"Processed {page_count} pages, found text on {pages_with_text} pages."
-        )
+        if not ocr_fallback:
+            raise Exception(
+                f"No text could be extracted from the PDF. "
+                f"This may be an image-based (scanned) PDF. "
+                f"Processed {page_count} pages, found text on {pages_with_text} pages."
+            )
+        # OCR fallback for scanned/image-based PDFs
+        from ingestion.ocr import extract_text_with_ocr
+        ocr_text = extract_text_with_ocr(file_path)
+        text_blocks = [(ocr_text, 1)]
+        ocr_used = True
 
-    # Step 1b: Strip trailing page numbers from each page's raw text
+    # Step 2: Strip trailing page numbers from each page's raw text
     cleaned_blocks: List[Tuple[str, int]] = []
     for page_text, page_num in text_blocks:
         lines = page_text.rstrip().split("\n")
@@ -398,10 +436,10 @@ def extract_text_from_pdf(
         cleaned_blocks.append((page_text, page_num))
     text_blocks = cleaned_blocks
 
-    # Step 2: Header/footer dedup (on raw text before normalization)
+    # Step 3: Header/footer dedup (on raw text before normalization)
     text_blocks = _detect_and_remove_headers_footers(text_blocks)
 
-    # Step 3: Normalize each page
+    # Step 4: Normalize each page
     normalized_pages: List[Tuple[str, int]] = []
     for page_text, page_num in text_blocks:
         normalized = _normalize_pdf_text(page_text)
@@ -410,9 +448,12 @@ def extract_text_from_pdf(
 
     if not normalized_pages:
         normalized = _normalize_pdf_text(text_blocks[0][0])
-        return [{"text": normalized, "page_number": text_blocks[0][1], "page_numbers": [text_blocks[0][1]]}]
+        chunk = {"text": normalized, "page_number": text_blocks[0][1], "page_numbers": [text_blocks[0][1]]}
+        if ocr_used:
+            chunk["ocr_used"] = True
+        return [chunk]
 
-    # Step 4: Concatenate all pages, tracking character offsets per page
+    # Step 5: Concatenate all pages, tracking character offsets per page
     full_text = ""
     page_offsets: List[Tuple[int, int, int]] = []  # (start, end, page_num)
     for page_text, page_num in normalized_pages:
@@ -424,16 +465,19 @@ def extract_text_from_pdf(
         end = len(full_text)
         page_offsets.append((start, end, page_num))
 
-    # Step 5: Chunk the full document
+    # Step 6: Chunk the full document
     if chunking_strategy == "semantic":
         raw_chunks = _semantic_chunk_text(full_text, embedding_model)
     else:
         raw_chunks = _chunk_text(full_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
     if not raw_chunks:
-        return [{"text": full_text, "page_number": normalized_pages[0][1], "page_numbers": [normalized_pages[0][1]]}]
+        chunk = {"text": full_text, "page_number": normalized_pages[0][1], "page_numbers": [normalized_pages[0][1]]}
+        if ocr_used:
+            chunk["ocr_used"] = True
+        return [chunk]
 
-    # Step 6: Map each raw chunk to page number(s) via offset ranges
+    # Step 7: Map each raw chunk to page number(s) via offset ranges
     chunk_page_mappings: List[List[int]] = []
     for chunk_text in raw_chunks:
         chunk_start = full_text.find(chunk_text)
@@ -451,13 +495,13 @@ def extract_text_from_pdf(
         else:
             chunk_page_mappings.append(pages_for_chunk)
 
-    # Step 7: Apply overlap (only for fixed chunking)
+    # Step 8: Apply overlap (only for fixed chunking)
     if chunking_strategy == "semantic":
         final_chunks = raw_chunks
     else:
         final_chunks = _apply_overlap(raw_chunks, chunk_overlap, chunk_size)
 
-    # Step 8: Build result — collapse newlines in non-table text
+    # Step 9: Build result — collapse newlines in non-table text
     all_chunks = []
     for i, chunk_text in enumerate(final_chunks):
         pages = chunk_page_mappings[i] if i < len(chunk_page_mappings) else [1]
@@ -475,10 +519,13 @@ def extract_text_from_pdf(
             merged.append(line)
         chunk_text = "\n".join(merged)
 
-        all_chunks.append({
+        chunk = {
             "text": chunk_text,
             "page_number": pages[0],
             "page_numbers": pages,
-        })
+        }
+        if ocr_used:
+            chunk["ocr_used"] = True
+        all_chunks.append(chunk)
 
     return all_chunks
