@@ -9,14 +9,17 @@ RUN apt-get update --fix-missing && \
     g++ \
     tesseract-ocr \
     poppler-utils \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install CPU-only PyTorch first (much smaller than CUDA version)
 # This prevents sentence-transformers from pulling the large CUDA dependencies
-# PyTorch >= 2.4 required by current transformers/sentence-transformers
+# PyTorch >= 2.6 required for torch.distributed.tensor.DTensor, imported by the
+# transformers version docling pulls in
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
-    torch==2.4.0+cpu \
-    torchvision==0.19.0+cpu
+    torch==2.6.0+cpu \
+    torchvision==0.21.0+cpu
 
 # Copy requirements first for better caching
 COPY requirements.txt .

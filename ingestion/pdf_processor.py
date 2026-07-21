@@ -25,11 +25,41 @@ Return chunks:
 10: Return the chunks.
 """
 
-
+import logging
 import re
 from collections import Counter
 from typing import List, Dict, Tuple, Any
 import fitz  # PyMuPDF
+
+logger = logging.getLogger(__name__)
+
+
+# Structural patterns that strongly indicate code/technical content.
+# Intentionally avoids prose keywords (return, if) that appear in normal sentences.
+_CODE_HINTS = re.compile(
+    r"[{};]"            # braces and semicolons
+    r"|->|=>"           # pointer dereference, fat arrow
+    r"|0x[0-9a-fA-F]"  # hex literals
+    r"|::\w"            # C++ scope resolution
+    r"|\b__\w+"         # __attribute__, __int64, __builtin_*
+)
+
+# A line likely ends mid-sentence (soft-wrapped prose) if it ends with a
+# lowercase letter or comma — not with closing punctuation or code tokens.
+_SOFT_WRAP_END = re.compile(r"[a-z,]$")
+
+
+def _looks_like_code(raw_line: str, stripped_line: str) -> bool:
+    """Return True if the line is likely code or technical content."""
+    # Indented lines are almost always code or structured output
+    if raw_line != raw_line.lstrip():
+        return True
+    if _CODE_HINTS.search(stripped_line):
+        return True
+    # Short lines ending with code-boundary punctuation
+    if len(stripped_line) < 80 and stripped_line.endswith(("(", "{", ":")):
+        return True
+    return False
 
 
 def _normalize_pdf_text(text: str) -> str:
@@ -37,7 +67,8 @@ def _normalize_pdf_text(text: str) -> str:
     Normalize text extracted from PDFs:
     - Normalize line endings
     - Convert bullet-like unicode chars to a common form
-    - Merge hard-wrapped lines inside paragraphs
+    - Merge hard-wrapped lines inside paragraphs (prose only)
+    - Preserve code blocks, indented lines, and technical content
     - Preserve paragraph breaks
     """
     if not text:
@@ -55,35 +86,39 @@ def _normalize_pdf_text(text: str) -> str:
     # Collapse 3+ newlines to 2 (keep paragraph breaks)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Merge wrapped lines: replace single newlines within paragraphs with spaces.
-    # Keep double newlines as paragraph separators.
-    # Also keep newlines before list items / headings heuristically.
+    # Merge soft-wrapped prose lines. Only merge when:
+    #   - neither line looks like code/technical content
+    #   - the current line ends mid-sentence (lowercase letter or comma)
+    # This preserves code blocks, assembly, hex dumps, and structured output.
     lines = text.split("\n")
     out = []
     i = 0
     while i < len(lines):
-        line = lines[i].strip()
+        raw_line = lines[i]
+        line = raw_line.strip()
+
         if line == "":
             out.append("")  # paragraph break marker
             i += 1
             continue
 
-        # If next line exists and is not empty, decide whether to merge
         if i + 1 < len(lines):
-            nxt = lines[i + 1].strip()
+            raw_nxt = lines[i + 1]
+            nxt = raw_nxt.strip()
 
-            # Keep newline if current or next looks like a list item
             is_list = bool(re.match(r"^(\-|\*|\u2022|\d+[\.\)]|[a-zA-Z][\.\)])\s+", line))
             next_is_list = bool(re.match(r"^(\-|\*|\u2022|\d+[\.\)]|[a-zA-Z][\.\)])\s+", nxt))
 
             if nxt != "" and not is_list and not next_is_list:
-                # Merge if line doesn't end a sentence strongly (but still merge often in PDFs)
-                # Also avoid merging if line ends with hyphenated word break: "exam-\nple" -> "example"
+                # Hyphenated word break: "exam-\nple" -> "example"
                 if line.endswith("-") and nxt and nxt[0].islower():
                     out.append(line[:-1] + nxt)
                     i += 2
                     continue
-                else:
+                # Merge only if both lines look like prose and current ends mid-sentence
+                if (not _looks_like_code(raw_line, line)
+                        and not _looks_like_code(raw_nxt, nxt)
+                        and bool(_SOFT_WRAP_END.search(line))):
                     out.append(line + " " + nxt)
                     i += 2
                     continue
@@ -93,7 +128,6 @@ def _normalize_pdf_text(text: str) -> str:
 
     # Rebuild with paragraphs
     normalized = "\n".join(out)
-    # Restore paragraph breaks from empty lines, collapse multiple empties to two newlines
     normalized = re.sub(r"\n\s*\n", "\n\n", normalized)
     normalized = re.sub(r"[ \t]{2,}", " ", normalized).strip()
     return normalized
@@ -353,30 +387,8 @@ def _semantic_chunk_text(text: str, embedding_model: str, max_chunk_size: int = 
     return result
 
 
-def extract_text_from_pdf(
-    file_path: str,
-    chunk_size: int = 2200,
-    chunk_overlap: int = 400,
-    chunking_strategy: str = "fixed",
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-    ocr_fallback: bool = True,
-) -> List[Dict[str, Any]]:
-    """
-    Extract text from PDF and split into chunks with page numbers.
-    Concatenates all pages for cross-page chunking.
-
-    Args:
-        file_path: Path to the PDF file
-        chunk_size: Maximum characters per chunk
-        chunk_overlap: Character overlap between chunks (good for RAG)
-
-    Returns:
-        List of dictionaries with 'text', 'page_number', 'page_numbers', and optionally
-        'ocr_used' (True when text was obtained via OCR fallback) keys.
-
-    Raises:
-        Exception: If PDF cannot be read, is encrypted, or OCR also fails
-    """
+def _extract_pages_pymupdf(file_path: str) -> Tuple[List[Tuple[str, int]], int]:
+    """Extract per-page text using PyMuPDF. Returns (pages, total_page_count)."""
     doc = fitz.open(file_path)
 
     if doc.is_encrypted:
@@ -396,22 +408,108 @@ def extract_text_from_pdf(
                      "wkhtmltopdf", "quartz pdfcontext", "headless"]
     use_sort = any(hint in producer or hint in creator for hint in browser_hints)
 
-    # Step 1: Extract all pages as (raw_text, page_number) tuples
     text_blocks: List[Tuple[str, int]] = []
-    pages_with_text = 0
-
     for i in range(doc.page_count):
         try:
             page = doc.load_page(i)
             page_text = page.get_text(sort=use_sort) or ""
             if page_text.strip():
                 text_blocks.append((page_text, i + 1))
-                pages_with_text += 1
         except Exception:
             continue
 
     page_count = doc.page_count
     doc.close()
+    return text_blocks, page_count
+
+
+_docling_converter = None
+
+
+def _get_docling_converter():
+    """Build the Docling converter once per process; its layout/OCR models are large."""
+    global _docling_converter
+    if _docling_converter is None:
+        from docling.document_converter import DocumentConverter
+        _docling_converter = DocumentConverter()
+    return _docling_converter
+
+
+def _extract_pages_docling(file_path: str) -> Tuple[List[Tuple[str, int]], int]:
+    """
+    Extract per-page text using Docling's layout-aware PDF converter.
+    Returns (pages, total_page_count) in the same shape as _extract_pages_pymupdf.
+    Docling handles reading order and scanned-page OCR internally.
+    """
+    logger.info("docling: converting %s", file_path)
+    try:
+        result = _get_docling_converter().convert(file_path)
+    except Exception as e:
+        logger.exception("docling: conversion failed for %s", file_path)
+        if "encrypt" in str(e).lower():
+            raise Exception(f"PDF is encrypted and cannot be decrypted: {e}")
+        raise
+    logger.info("docling: conversion succeeded for %s", file_path)
+
+    doc = result.document
+    page_count = doc.num_pages() if hasattr(doc, "num_pages") else len(doc.pages)
+    if page_count == 0:
+        raise Exception("PDF has no pages")
+
+    pages_text: Dict[int, List[str]] = {}
+    for item, _level in doc.iterate_items():
+        prov = getattr(item, "prov", None)
+        if not prov:
+            continue
+        page_no = prov[0].page_no
+        # Tables render better as markdown; everything else exposes plain .text
+        if hasattr(item, "export_to_markdown"):
+            text = item.export_to_markdown(doc)
+        else:
+            text = getattr(item, "text", "")
+        if text and text.strip():
+            pages_text.setdefault(page_no, []).append(text)
+
+    text_blocks = [("\n\n".join(texts), page_no) for page_no, texts in sorted(pages_text.items())]
+    return text_blocks, page_count
+
+
+def extract_text_from_pdf(
+    file_path: str,
+    chunk_size: int = 2200,
+    chunk_overlap: int = 400,
+    chunking_strategy: str = "fixed",
+    embedding_model: str = "intfloat/multilingual-e5-base",
+    ocr_fallback: bool = True,
+    extraction_backend: str = "pymupdf",
+) -> List[Dict[str, Any]]:
+    """
+    Extract text from PDF and split into chunks with page numbers.
+    Concatenates all pages for cross-page chunking.
+
+    Args:
+        file_path: Path to the PDF file
+        chunk_size: Maximum characters per chunk
+        chunk_overlap: Character overlap between chunks (good for RAG)
+        extraction_backend: "pymupdf" (fast, default) or "docling" (layout-aware,
+            better table/reading-order handling, built-in OCR for scanned pages)
+
+    Returns:
+        List of dictionaries with 'text', 'page_number', 'page_numbers', and optionally
+        'ocr_used' (True when text was obtained via OCR fallback) keys.
+
+    Raises:
+        Exception: If PDF cannot be read, is encrypted, or OCR also fails
+    """
+    logger.info("extract_text_from_pdf: using extraction_backend=%r for %s", extraction_backend, file_path)
+    if extraction_backend == "docling":
+        text_blocks, page_count = _extract_pages_docling(file_path)
+    elif extraction_backend == "pymupdf":
+        text_blocks, page_count = _extract_pages_pymupdf(file_path)
+    else:
+        raise ValueError(f"Unknown extraction_backend: {extraction_backend!r}. Use 'pymupdf' or 'docling'.")
+
+    pages_with_text = len(text_blocks)
 
     ocr_used = False
     if not text_blocks:
@@ -477,23 +575,24 @@ def extract_text_from_pdf(
             chunk["ocr_used"] = True
         return [chunk]
 
-    # Step 7: Map each raw chunk to page number(s) via offset ranges
+    # Step 7: Map each raw chunk to page number(s) via offset ranges.
+    # Chunks are produced in order from full_text, so we advance search_pos
+    # after each match to avoid re-scanning text we've already passed.
     chunk_page_mappings: List[List[int]] = []
+    search_pos = 0
     for chunk_text in raw_chunks:
-        chunk_start = full_text.find(chunk_text)
+        chunk_start = full_text.find(chunk_text, search_pos)
         if chunk_start == -1:
             # Fallback: assign to last known page
             chunk_page_mappings.append([normalized_pages[-1][1]])
             continue
         chunk_end = chunk_start + len(chunk_text)
-        pages_for_chunk = []
-        for p_start, p_end, p_num in page_offsets:
-            if chunk_start < p_end and chunk_end > p_start:
-                pages_for_chunk.append(p_num)
-        if not pages_for_chunk:
-            chunk_page_mappings.append([normalized_pages[-1][1]])
-        else:
-            chunk_page_mappings.append(pages_for_chunk)
+        pages_for_chunk = [
+            p_num for p_start, p_end, p_num in page_offsets
+            if chunk_start < p_end and chunk_end > p_start
+        ]
+        chunk_page_mappings.append(pages_for_chunk or [normalized_pages[-1][1]])
+        search_pos = chunk_end
 
     # Step 8: Apply overlap (only for fixed chunking)
     if chunking_strategy == "semantic":

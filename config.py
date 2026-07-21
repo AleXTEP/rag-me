@@ -10,6 +10,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
 CHUNKING_STRATEGY = os.getenv("CHUNKING_STRATEGY", "fixed")
+EXTRACTION_BACKEND = os.getenv("EXTRACTION_BACKEND", "pymupdf")  # pymupdf | docling
 USE_ELASTICSEARCH = os.getenv("USE_ELASTICSEARCH", "true").lower() == "true"
 
 # HyDE (Hypothetical Document Embeddings)

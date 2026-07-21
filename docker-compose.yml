@@ -67,6 +67,7 @@ services:
       - RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
       - UPLOAD_DIR=/app/uploads
       - CHUNKING_STRATEGY=fixed
+      - EXTRACTION_BACKEND=pymupdf
       - HYDE_PROVIDER=claude
       - HYDE_MODEL=claude-haiku-4-5-20251001
       - HYDE_API_KEY=${HYDE_API_KEY:-}
@@ -97,6 +98,7 @@ services:
       - RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
       - UPLOAD_DIR=/app/uploads
       - CHUNKING_STRATEGY=fixed
+      - EXTRACTION_BACKEND=pymupdf
       - USE_ELASTICSEARCH=true
     volumes:
       - .:/app
@@ -109,7 +111,9 @@ services:
       elasticsearch:
         condition: service_healthy
     restart: unless-stopped
-    command: celery -A worker.celery_app worker --loglevel=info
+    # concurrency is capped: each fork worker loads docling + the embedding model
+    # (~1.5-2 GB each), and the default (one per CPU) exhausts the Docker VM memory
+    command: celery -A worker.celery_app worker --loglevel=info --concurrency=2 --max-tasks-per-child=20
 
 volumes:
   weaviate_data:

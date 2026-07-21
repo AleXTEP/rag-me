@@ -8,6 +8,7 @@ weaviate-client==4.4.0
 python-dotenv==1.0.0
 elasticsearch==8.11.0
 pymupdf>=1.24.0
+docling>=2.0.0
 langchain-experimental
 langchain-huggingface
 anthropic
