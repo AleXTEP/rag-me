@@ -6,11 +6,14 @@ load_dotenv()
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8080")
 ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
+# E5-family models expect these prefixes; set both to "" for models that don't use them.
+EMBEDDING_QUERY_PREFIX = os.getenv("EMBEDDING_QUERY_PREFIX", "query: ")
+EMBEDDING_PASSAGE_PREFIX = os.getenv("EMBEDDING_PASSAGE_PREFIX", "passage: ")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
 CHUNKING_STRATEGY = os.getenv("CHUNKING_STRATEGY", "fixed")
-EXTRACTION_BACKEND = os.getenv("EXTRACTION_BACKEND", "pymupdf")  # pymupdf | docling
+EXTRACTION_BACKEND = os.getenv("EXTRACTION_BACKEND", "pymupdf")
 USE_ELASTICSEARCH = os.getenv("USE_ELASTICSEARCH", "true").lower() == "true"
 
 # HyDE (Hypothetical Document Embeddings)

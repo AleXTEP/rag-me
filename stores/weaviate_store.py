@@ -8,6 +8,7 @@ from weaviate.classes.config import Property, DataType
 from weaviate.collections.classes.filters import Filter
 
 from stores.base import BaseStore
+from config import EMBEDDING_QUERY_PREFIX, EMBEDDING_PASSAGE_PREFIX
 
 
 class WeaviateStore(BaseStore):
@@ -26,6 +27,12 @@ class WeaviateStore(BaseStore):
 
         self.collection_name = "Document"
         self._ensure_collection()
+
+    def embed_passages(self, texts: List[str]) -> List[List[float]]:
+        return self.embedding_model.encode([EMBEDDING_PASSAGE_PREFIX + t for t in texts]).tolist()
+
+    def embed_query(self, query: str) -> List[float]:
+        return self.embedding_model.encode([EMBEDDING_QUERY_PREFIX + query]).tolist()[0]
 
     def _ensure_collection(self):
         if not self.client.collections.exists(self.collection_name):
@@ -54,7 +61,7 @@ class WeaviateStore(BaseStore):
                 chunk_texts.append(chunk)
                 chunk_pages.append(1)
 
-        embeddings = self.embedding_model.encode(chunk_texts).tolist()
+        embeddings = self.embed_passages(chunk_texts)
 
         chunk_count = len(chunk_texts)
         page_count = len(set(chunk_pages))
@@ -92,7 +99,7 @@ class WeaviateStore(BaseStore):
     def search(self, query: str, n_results: int = 5):
         collection = self.client.collections.get(self.collection_name)
 
-        query_embedding = self.embedding_model.encode([query]).tolist()[0]
+        query_embedding = self.embed_query(query)
 
         results = collection.query.near_vector(
             near_vector=query_embedding,
