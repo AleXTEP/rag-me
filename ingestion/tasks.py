@@ -1,8 +1,11 @@
+import logging
 import os
 from worker.celery_app import celery_app
-from config import WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, UPLOAD_DIR, CHUNKING_STRATEGY, USE_ELASTICSEARCH
+from config import WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, UPLOAD_DIR, CHUNKING_STRATEGY, USE_ELASTICSEARCH, EXTRACTION_BACKEND
 from ingestion.pdf_processor import extract_text_from_pdf
 from stores import get_store
+
+logger = logging.getLogger(__name__)
 
 @celery_app.task(name="process_pdf")
 def process_pdf_task(file_path: str, file_id: str, filename: str):
@@ -24,6 +27,7 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
                 file_path,
                 chunking_strategy=CHUNKING_STRATEGY,
                 embedding_model=EMBEDDING_MODEL,
+                extraction_backend=EXTRACTION_BACKEND,
             )
         except Exception as e:
             # Provide detailed error message
@@ -72,10 +76,6 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
                     pass  # best-effort rollback
             raise
 
-        # Clean up uploaded file
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
         result = {
             "status": "success",
             "file_id": file_id,
@@ -85,7 +85,11 @@ def process_pdf_task(file_path: str, file_id: str, filename: str):
             result["ocr_used"] = True
         return result
     except Exception as e:
-        # Clean up on error
-        if os.path.exists(file_path):
-            os.remove(file_path)
         return {"status": "error", "message": str(e)}
+    finally:
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("Failed to remove uploaded file %s", file_path)
