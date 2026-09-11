@@ -15,5 +15,13 @@ chroma_db/
 uploads/
 *.log
 rag2/*
+
+# macOS
+.DS_Store
+
+# Test corpus (PDFs, archives, run output) stays out of the repo,
+# but the eval and inspection scripts are tracked.
 tests/*
-tests/
+!tests/*.py
+
+scripts/*
