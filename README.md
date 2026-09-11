@@ -1,483 +1,294 @@
-# RAG System
+# RAG
 
-A comprehensive RAG (Retrieval-Augmented Generation) system built with Python, FastAPI, Celery, Redis, Weaviate, and Elasticsearch. This system provides both semantic (vector) and keyword-based search capabilities, with hybrid search using Reciprocal Rank Fusion (RRF) for optimal results.
+A Retrieval-Augmented Generation backend built with FastAPI, Celery, Weaviate, and Elasticsearch. Supports vector, keyword, and hybrid search with RRF fusion, cross-encoder reranking, HyDE query expansion, and OCR fallback for scanned PDFs.
 
-## Features
+## Stack
 
-- **PDF File Upload**: Upload PDF files via REST API with automatic processing
-- **Asynchronous Processing**: Background processing with Celery and Redis
-- **Dual Search Capabilities**:
-  - **Semantic Search**: Vector-based similarity search using Weaviate
-  - **Keyword Search**: Full-text keyword search using Elasticsearch
-  - **Hybrid Search**: Combines both search methods using Reciprocal Rank Fusion (RRF)
-- **Text Extraction**: Automatic text extraction from PDFs with chunking
-- **Text Embedding**: Uses sentence transformers for generating embeddings
-- **Document Management**: List and delete documents with metadata
-- **Context Retrieval**: Retrieve surrounding chunks for enriched search results
+| Component | Role |
+|---|---|
+| FastAPI | REST API server |
+| Celery + Redis | Async task queue for PDF ingestion |
+| Weaviate | Vector store — semantic search + BM25 fallback |
+| Elasticsearch | Full-text keyword search (optional) |
+| PyMuPDF (fitz) | PDF text extraction |
+| Tesseract (OCR) | Fallback for scanned/image-based PDFs |
+| sentence-transformers | Embedding generation (`intfloat/multilingual-e5-base` default: multilingual, 512-token window) |
+| CrossEncoder | Reranking (`ms-marco-MiniLM-L-6-v2` default) |
+| HyDE | Hypothetical document expansion before vector search |
 
-## Architecture
+## Components
 
-- **FastAPI**: REST API server
-- **Celery**: Asynchronous task queue
-- **Redis**: Message broker and result backend
-- **Weaviate**: Vector database for semantic search
-- **Elasticsearch**: Full-text search engine for keyword search
-- **Sentence Transformers**: Embedding generation
+### `ingestion/`
+- **`pdf_processor.py`** — Full PDF pipeline: browser-PDF detection, page extraction, header/footer dedup, text normalization, fixed or semantic chunking with overlap, page offset mapping, OCR fallback.
+- **`ocr.py`** — Tesseract-based OCR for image-only PDFs, with optional API-based providers.
+- **`tasks.py`** — Celery task that runs the ingestion pipeline and writes chunks to Weaviate and Elasticsearch.
 
-## Prerequisites
+### `retrieval/`
+- **`fusion.py`** — Reciprocal Rank Fusion (RRF) over a vector result set and a keyword result set. Formula: `Σ 1 / (k + rank)`, default k=60. Rank-based, so it is safe across engines whose scores are not comparable.
+- **`reranker.py`** — Cross-encoder reranking (lazy-loaded). Scores `(query, chunk)` pairs and returns top-N.
+- **`hyde.py`** — HyDE: generates a 3–5 sentence hypothetical answer via an LLM, embeds that instead of the raw query. Affects only the vector half; keyword matching and reranking stay on the user's words. Supports Claude, OpenAI, and local Ollama providers.
+- **`pipeline.py`** — Shared hybrid retrieval used by both `/search/double` endpoints. Selects the retrieval mode, applies HyDE, fuses, reranks.
 
-- Docker and Docker Compose
+### `stores/`
+- **`weaviate_store.py`** — Weaviate client: upsert chunks with embeddings, vector search, alpha-blended hybrid search, chunk range fetch, document delete.
+- **`elasticsearch_store.py`** — ES client: index chunks, BM25 keyword search, chunk range fetch, document delete.
+- **`base.py`** — Shared store interface.
 
-## Quick Start with Docker Compose
+### `api/`
+- **`main.py`** — Route definitions. Retrieval itself lives in `retrieval/pipeline.py`.
+- **`deps.py`** — FastAPI dependency injection for store singletons.
+- **`schemas.py`** — Pydantic request models.
 
-The easiest way to run the entire system:
+### `worker/`
+- **`celery_app.py`** — Celery application configuration (broker: Redis).
+
+## Ingestion Pipeline
+
+```
+POST /upload
+  → save file to disk
+  → enqueue Celery task
+      → extract text per page (PyMuPDF, sort=True for browser PDFs)
+      → OCR fallback if no text found
+      → strip page numbers, remove repeated headers/footers
+      → normalize text (line merging, bullet normalization)
+      → chunk: fixed (paragraph → sentence → word) or semantic (embedding similarity)
+      → apply overlap (fixed only)
+      → map chunks to page numbers via character offsets
+      → write to Weaviate (vectors) + Elasticsearch (text)
+      → delete temp file
+```
+
+## Search Pipeline (hybrid)
+
+```
+POST /search/double or /search/double/context
+  → optional HyDE: query → LLM → hypothetical passage → embed (vector half only)
+  → mode "rrf"             (Elasticsearch enabled):
+      → Weaviate vector search (fetch_limit = limit × 4)
+      → Elasticsearch BM25 search (fetch_limit)
+      → RRF fusion (k=60) over both result sets
+  → mode "weaviate_hybrid" (Elasticsearch disabled):
+      → Weaviate built-in hybrid(), vector/BM25 blended by `alpha` in one call
+  → optional CrossEncoder reranking (always on the raw query) → top N
+  → /context variant: group by document, expand ±N chunks, merge text
+```
+
+## Configuration
+
+All settings via environment variables (`.env` supported):
+
+| Variable | Default | Description |
+|---|---|---|
+| `REDIS_URL` | `redis://localhost:6379/0` | Celery broker + result backend |
+| `WEAVIATE_URL` | `http://localhost:8080` | Weaviate instance |
+| `ELASTICSEARCH_URL` | `http://localhost:9200` | Elasticsearch instance |
+| `USE_ELASTICSEARCH` | `true` | Disable to use Weaviate BM25 for keyword search |
+| `EMBEDDING_MODEL` | `intfloat/multilingual-e5-base` | Embedding model (multilingual, 512-token window) |
+| `EMBEDDING_QUERY_PREFIX` | `query: ` | Prefix prepended before embedding queries (E5 convention; set empty for other models) |
+| `EMBEDDING_PASSAGE_PREFIX` | `passage: ` | Prefix prepended before embedding chunks |
+| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | CrossEncoder model |
+| `CHUNKING_STRATEGY` | `fixed` | `fixed` or `semantic` |
+| `UPLOAD_DIR` | `./uploads` | Temp directory for uploaded PDFs |
+| `HYDE_PROVIDER` | `claude` | `claude` \| `openai` \| `local` |
+| `HYDE_MODEL` | `claude-haiku-4-5-20251001` | LLM model for HyDE |
+| `HYDE_API_KEY` | — | API key (falls back to SDK env defaults) |
+| `HYDE_LOCAL_URL` | `http://localhost:11434` | Ollama base URL |
+| `OCR_PROVIDER` | `tesseract` | `tesseract` \| `deepseek` \| `custom` |
+| `OCR_API_KEY` | — | API key for non-Tesseract OCR |
+| `OCR_API_URL` | — | Endpoint for custom OCR provider |
+
+## Quick Start
 
 ```bash
-# Build and start all services
 docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# View logs for a specific service
-docker-compose logs -f api
-docker-compose logs -f celery-worker
-docker-compose logs -f weaviate
-docker-compose logs -f elasticsearch
-
-# Stop all services
-docker-compose down
-
-# Stop and remove volumes (clears data)
-docker-compose down -v
-
-# Rebuild after code changes
-docker-compose up -d --build
 ```
 
-This will start:
-- **Weaviate** on port 8080 (vector database)
-- **Elasticsearch** on port 9200 (search engine)
-- **Redis** on port 6379 (message broker)
-- **API Server** on port 8000
-- **Celery Worker** for background processing
+Services:
+- API: `http://localhost:8000`
+- Weaviate: `http://localhost:8080`
+- Elasticsearch: `http://localhost:9200`
+- Redis: `localhost:6379`
 
-The API will be available at `http://localhost:8000`
-
-**Note**: Services may take 30-60 seconds to fully start. Health checks ensure services are ready before the API starts.
-
-## Manual Setup (Local Development)
-
-If you prefer to run services locally:
-
-### Prerequisites
-
-- Python 3.8+
-- Redis server running (default: localhost:6379)
-- Docker (for running Weaviate and Elasticsearch)
-
-### Installation
-
-1. Clone the repository and navigate to the project directory:
-```bash
-cd rag2
-```
-
-2. Create a virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-4. Create a `.env` file (optional, defaults are provided):
-```bash
-REDIS_URL=redis://localhost:6379/0
-WEAVIATE_URL=http://localhost:8080
-ELASTICSEARCH_URL=http://localhost:9200
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-UPLOAD_DIR=./uploads
-```
-
-### Running the System
-
-#### 1. Start Weaviate
-
-Start Weaviate using Docker:
-```bash
-docker run -d \
-  --name weaviate \
-  -p 8080:8080 \
-  -p 50051:50051 \
-  -e QUERY_DEFAULTS_LIMIT=25 \
-  -e AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
-  -e PERSISTENCE_DATA_PATH=/var/lib/weaviate \
-  -v weaviate_data:/var/lib/weaviate \
-  semitechnologies/weaviate:1.24.0
-```
-
-#### 2. Start Elasticsearch
-
-Start Elasticsearch using Docker:
-```bash
-docker run -d \
-  --name elasticsearch \
-  -p 9200:9200 \
-  -p 9300:9300 \
-  -e discovery.type=single-node \
-  -e xpack.security.enabled=false \
-  -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
-  docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-```
-
-#### 3. Start Redis
-
-Make sure Redis is running:
-```bash 
-redis-server
-```
-
-#### 4. Start Celery Worker
-
-In a separate terminal:
-```bash
-celery -A celery_app worker --loglevel=info
-```
-
-#### 5. Start the API Server
-
-In another terminal:
-```bash
-python main.py
-```
-
-Or using uvicorn directly:
-```bash
-uvicorn main:app --reload
-```
-
-The API will be available at `http://localhost:8000`
+Allow 30–60 seconds for health checks before the API accepts requests.
 
 ## API Endpoints
 
-### Health Check
+### `GET /health`
+Returns `{"status": "healthy"}`.
 
-```bash
-GET /health
+---
 
-curl "http://localhost:8000/health"
-```
+### `POST /upload`
+Upload a PDF for async ingestion.
 
-Response:
-```json
-{
-  "status": "healthy"
-}
-```
+**Body:** `multipart/form-data`, field `file` (`.pdf` only).
 
-### Upload PDF File
-
-Upload a PDF file for processing. The file will be queued for asynchronous processing.
-
-```bash
-POST /upload
-Content-Type: multipart/form-data
-
-curl -X POST "http://localhost:8000/upload" \
-  -F "file=@your_document.pdf"
-```
-
-Response:
+**Response:**
 ```json
 {
   "status": "queued",
-  "file_id": "uuid-here",
-  "task_id": "celery-task-id",
-  "filename": "your_document.pdf",
+  "file_id": "<uuid>",
+  "task_id": "<celery-task-id>",
+  "filename": "doc.pdf",
   "message": "File uploaded and queued for processing"
 }
 ```
 
-**Note**: If a file with the same filename already exists, you'll receive a 409 Conflict error.
+Returns `409` if the filename already exists.
 
-### Check Task Status
+---
 
-Monitor the processing status of an uploaded file.
+### `GET /task/{task_id}`
+Poll ingestion task status.
 
-```bash
-GET /task/{task_id}
+**States:** `PENDING` | `PROGRESS` | `SUCCESS` | `FAILURE`
 
-curl "http://localhost:8000/task/{task_id}"
-```
-
-Response (PENDING):
-```json
-{
-  "state": "PENDING",
-  "status": "Task is waiting to be processed"
-}
-```
-
-Response (SUCCESS):
+**Response (SUCCESS):**
 ```json
 {
   "state": "SUCCESS",
+  "status": "success",
   "result": {
-    "file_id": "uuid-here",
-    "filename": "your_document.pdf",
-    "chunks_processed": 42,
-    "status": "completed"
+    "file_id": "<uuid>",
+    "filename": "doc.pdf",
+    "chunks_processed": 42
   }
 }
 ```
 
-### List Documents
+---
 
-Get a list of all documents in the system with their metadata.
+### `GET /documents`
+List all indexed documents with chunk counts.
 
-```bash
-GET /documents
-
-curl "http://localhost:8000/documents"
-```
-
-Response:
 ```json
 {
-  "documents": [
-    {
-      "file_id": "uuid-here",
-      "filename": "document.pdf",
-      "chunk_count": 42
-    }
-  ],
+  "documents": [{"file_id": "<uuid>", "filename": "doc.pdf", "chunk_count": 42}],
   "count": 1
 }
 ```
 
-### Delete Document
+---
 
-Delete a document and all its chunks by file_id. Removes the document from both Weaviate and Elasticsearch.
+### `DELETE /documents/{file_id}`
+Remove a document from Weaviate and Elasticsearch.
 
-```bash
-DELETE /documents/{file_id}
-
-curl -X DELETE "http://localhost:8000/documents/{file_id}"
-```
-
-Response:
 ```json
 {
   "status": "success",
-  "file_id": "uuid-here",
+  "file_id": "<uuid>",
   "weaviate_chunks_deleted": 42,
-  "elasticsearch_chunks_deleted": 42,
-  "message": "Document 'uuid-here' deleted successfully"
+  "elasticsearch_chunks_deleted": 42
 }
 ```
 
-### Semantic Search
+---
 
-Search for similar documents using vector similarity (semantic search via Weaviate).
+### `POST /search/vector`
+Pure vector similarity search via Weaviate.
 
-```bash
-POST /search
-Content-Type: application/json
-
-curl -X POST "http://localhost:8000/search" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "q": "your search query",
-    "limit": 5
-  }'
+**Body:**
+```json
+{"q": "query text", "limit": 5}
 ```
 
-Request Body:
+**Response:** `{"objects": [{...chunk fields, "distance": 0.12}]}`
+
+---
+
+### `POST /search/keywords`
+BM25 keyword search. Uses Elasticsearch when enabled, falls back to Weaviate BM25.
+
+**Body:**
+```json
+{"q": "query text", "limit": 5}
+```
+
+**Response:** `{"objects": [{...chunk fields, "score": 0.95}]}`
+
+---
+
+### `POST /search/double`
+Hybrid search: vector + keyword → RRF fusion → cross-encoder rerank.
+
+Supports `use_hyde: true` to expand the query via HyDE before vector search, and
+`rerank: false` to skip the cross-encoder. `alpha` applies only when Elasticsearch is
+disabled and is ignored in RRF mode.
+
+**Body:**
+```json
+{"q": "query text", "limit": 5, "use_hyde": false, "rerank": true, "alpha": 0.5}
+```
+
+**Response:**
 ```json
 {
-  "q": "your search query",
-  "limit": 5  // Optional, default: 5, max: 50
-}
-```
-
-Response:
-```json
-{
-  "objects": [
-    {
-      "file_id": "uuid-here",
-      "filename": "document.pdf",
-      "chunk_index": 5,
-      "chunk_count": 42,
-      "text": "chunk text content...",
-      "distance": 0.123,
-      "page_number": 1
-    }
-  ]
-}
-```
-
-### Keyword Search
-
-Search for documents by keywords using Elasticsearch full-text search.
-
-```bash
-POST /search/keywords
-Content-Type: application/json
-
-curl -X POST "http://localhost:8000/search/keywords" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "q": "your keywords",
-    "limit": 5
-  }'
-```
-
-Request Body:
-```json
-{
-  "q": "your keywords",
-  "limit": 5  // Optional, default: 5, max: 50
-}
-```
-
-Response:
-```json
-{
-  "objects": [
-    {
-      "file_id": "uuid-here",
-      "filename": "document.pdf",
-      "chunk_index": 5,
-      "chunk_count": 42,
-      "text": "chunk text content...",
-      "score": 0.95,
-      "highlight": {
-        "text": ["highlighted <em>keywords</em> in context"]
-      },
-      "page_number": 1
-    }
-  ]
-}
-```
-
-### Hybrid Search (Double Search)
-
-Search using both semantic and keyword search, combining results using Reciprocal Rank Fusion (RRF). This provides the best of both worlds - semantic understanding and keyword matching.
-
-```bash
-POST /search/double
-Content-Type: application/json
-
-curl -X POST "http://localhost:8000/search/double" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "q": "your search query",
-    "limit": 5
-  }'
-```
-
-Request Body:
-```json
-{
-  "q": "your search query",
-  "limit": 5  // Optional, default: 5, max: 50
-}
-```
-
-Response:
-```json
-{
-  "objects": [
-    {
-      "file_id": "uuid-here",
-      "filename": "document.pdf",
-      "chunk_index": 5,
-      "chunk_count": 42,
-      "text": "chunk text content...",
-      "sources": ["weaviate", "elasticsearch"],
-      "weaviate_rank": 1,
-      "elasticsearch_rank": 2,
-      "rrf_score": 0.0328,
-      "distance": 0.123,
-      "score": 0.95,
-      "page_number": 1
-    }
-  ],
-  "weaviate_count": 5,
-  "elasticsearch_count": 5,
-  "combined_count": 8,
-  "unique_count": 8,
+  "objects": [{
+    "file_id": "<uuid>",
+    "filename": "doc.pdf",
+    "chunk_index": 5,
+    "text": "...",
+    "rerank_score": 4.21,
+    "rrf_score": 0.033
+  }],
+  "retrieval_mode": "rrf",
+  "vector_count": 20,
+  "keyword_count": 20,
+  "unique_count": 31,
+  "combined_count": 5,
   "rrf_k": 60
 }
 ```
 
-### Hybrid Search with Context
+`retrieval_mode` names the strategy that actually ran, so a result is self-describing.
+When Elasticsearch is disabled the same endpoint returns the alpha-blend diagnostics instead:
 
-Similar to hybrid search, but retrieves surrounding chunks for each result to provide more context. Useful for RAG applications where you need complete context around matching chunks.
-
-```bash
-POST /search/double/context
-Content-Type: application/json
-
-curl -X POST "http://localhost:8000/search/double/context" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "q": "your search query",
-    "limit": 5,
-    "context_chunks": 5
-  }'
-```
-
-Request Body:
 ```json
 {
-  "q": "your search query",
-  "limit": 5,  // Optional, default: 5, max: 50
-  "context_chunks": 5  // Optional, default: 5, max: 20 (chunks before/after each result)
+  "objects": [{"...": "...", "rerank_score": 4.21, "score": 0.87}],
+  "retrieval_mode": "weaviate_hybrid",
+  "alpha": 0.5,
+  "candidate_count": 20,
+  "combined_count": 5
 }
 ```
 
-Response:
+---
+
+### `POST /search/double/context`
+Hybrid search with chunk-window expansion, grouped by document.
+
+Runs the same retrieval pipeline as `/search/double`, then for each matched document: collects all hit chunk indices, expands each by `±context_chunks`, fetches the full range from the store, and joins the text.
+
+**Body:**
+```json
+{"q": "query text", "limit": 5, "context_chunks": 3, "use_hyde": false, "rerank": true}
+```
+
+**Response:**
 ```json
 {
-  "objects": [
-    {
-      "file_id": "uuid-here",
-      "filename": "document.pdf",
-      "chunk_index": 5,
-      "chunk_count": 42,
-      "text": "chunk text content...",
-      "sources": ["weaviate", "elasticsearch"],
-      "weaviate_rank": 1,
-      "elasticsearch_rank": 2,
-      "rrf_score": 0.0328,
-      "original_chunk_index": 5,
-      "context_chunks": 5,
-      "retrieved_chunk_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-      "surrounding_chunks": [
-        {
-          "chunk_index": 0,
-          "text": "chunk 0 text...",
-          "page_number": 1
-        },
-        // ... more chunks
-      ],
-      "joined_text": "chunk 0 text...\nchunk 1 text...\n...",
-      "chunk_count_in_context": 11,
-      "page_number": 1
-    }
-  ],
-  "weaviate_count": 5,
-  "elasticsearch_count": 5,
-  "combined_count": 8,
-  "unique_count": 8,
+  "documents": [{
+    "file_id": "<uuid>",
+    "filename": "doc.pdf",
+    "selected_chunk_indices": [5, 8],
+    "augmented_chunk_indices": [2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "chunk_count": 42,
+    "selected_count": 2,
+    "augmented_count": 10,
+    "chunks": [{...}],
+    "joined_text": "full merged context string",
+    "results": [{...reranked chunk hits}]
+  }],
+  "document_count": 1,
+  "retrieval_mode": "rrf",
+  "vector_count": 20,
+  "keyword_count": 20,
+  "unique_count": 31,
+  "combined_count": 5,
   "rrf_k": 60,
-  "context_chunks": 5
+  "context_chunks": 3
 }
 ```
 
@@ -485,77 +296,27 @@ Response:
 
 ```
 rag2/
-├── main.py                  # FastAPI application and endpoints
-├── celery_app.py            # Celery configuration
-├── tasks.py                 # Celery tasks for PDF processing
-├── pdf_processor.py         # PDF text extraction and chunking
-├── vector_store.py          # Weaviate vector database operations
-├── elasticsearch_store.py   # Elasticsearch operations
-├── config.py                # Configuration settings
-├── requirements.txt         # Python dependencies
-├── Dockerfile               # Docker image definition
-├── docker-compose.yml       # Docker Compose configuration
-├── uploads/                 # Temporary storage for uploaded PDFs
-├── tests/                   # Test scripts and sample PDFs
-│   ├── test_upload.sh
-│   ├── test_query.sh
-│   ├── test_query_keywords.sh
-│   ├── test_query_double.sh
-│   └── TESTING.md
-└── README.md                # This file
+├── api/
+│   ├── main.py              # Route definitions
+│   ├── deps.py              # Store dependency injection
+│   └── schemas.py           # Request/response models
+├── ingestion/
+│   ├── pdf_processor.py     # PDF extraction + chunking pipeline
+│   ├── ocr.py               # OCR fallback
+│   └── tasks.py             # Celery ingestion task
+├── retrieval/
+│   ├── fusion.py            # RRF fusion
+│   ├── reranker.py          # Cross-encoder reranking
+│   └── hyde.py              # HyDE query expansion
+├── stores/
+│   ├── weaviate_store.py    # Weaviate operations
+│   ├── elasticsearch_store.py
+│   └── base.py
+├── worker/
+│   └── celery_app.py        # Celery configuration
+├── config.py                # Env-var config
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+└── tests/
 ```
-
-## How It Works
-
-1. **Upload**: Client uploads a PDF file via the `/upload` endpoint
-2. **Queue**: File is saved and a Celery task is queued in Redis
-3. **Processing**: Celery worker picks up the task and:
-   - Extracts text from the PDF using PyPDF2
-   - Splits text into chunks (overlapping chunks for better context)
-   - Generates embeddings using sentence transformers
-   - Stores embeddings in Weaviate vector database
-   - Stores text chunks in Elasticsearch for keyword search
-4. **Status**: Client can check task status using the task ID
-5. **Search**: Multiple search endpoints available:
-   - Semantic search via Weaviate
-   - Keyword search via Elasticsearch
-   - Hybrid search combining both with RRF
-
-## Reciprocal Rank Fusion (RRF)
-
-The hybrid search (`/search/double` and `/search/double/context`) uses Reciprocal Rank Fusion to combine results from both Weaviate and Elasticsearch:
-
-- **RRF Score**: `sum(1 / (k + rank))` for each source where the result appears
-- **Default k**: 60 (standard RRF constant)
-- Results are sorted by RRF score in descending order
-- Duplicate results (same file_id + chunk_index) are merged with combined ranks
-
-This approach ensures that results appearing high in both search results get boosted, while still including unique results from either source.
-
-## Configuration
-
-Configuration is managed via environment variables (with defaults):
-
-- `REDIS_URL`: Redis connection URL (default: `redis://localhost:6379/0`)
-- `WEAVIATE_URL`: Weaviate instance URL (default: `http://localhost:8080`)
-- `ELASTICSEARCH_URL`: Elasticsearch instance URL (default: `http://localhost:9200`)
-- `EMBEDDING_MODEL`: Sentence transformer model (default: `sentence-transformers/all-MiniLM-L6-v2`)
-- `UPLOAD_DIR`: Directory for temporary file storage (default: `./uploads`)
-
-## Notes
-
-- PDF files are automatically deleted after processing
-- The default embedding model is `all-MiniLM-L6-v2` (fast and efficient, ~80MB)
-- Weaviate and Elasticsearch run in Docker and persist data in Docker volumes
-- Uploaded files are temporarily stored in `./uploads` (or configured `UPLOAD_DIR`)
-- Make sure all services (Weaviate, Elasticsearch, Redis) are running before processing files
-- Filenames must be unique - duplicate filenames will be rejected with a 409 Conflict error
-- The system uses overlapping chunks for better context preservation
-
-## Testing
-
-See `tests/TESTING.md` for detailed testing instructions and example scripts.
-
-## License
-
-[Add your license here]
