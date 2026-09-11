@@ -25,3 +25,4 @@ tests/*
 !tests/*.py
 
 scripts/*
+.vscode/
