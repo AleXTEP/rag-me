@@ -15,6 +15,11 @@ def _get_cross_encoder() -> CrossEncoder:
     return _cross_encoder
 
 
+def warmup_cross_encoder() -> None:
+    """Load the cross-encoder model eagerly, so it isn't loaded lazily on the first search."""
+    _get_cross_encoder()
+
+
 def rerank_cross_encoder(query: str, results: list, top_n: int) -> list:
     """
     Rerank results using a cross-encoder model.

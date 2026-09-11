@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 import os
 import uuid
 from typing import Optional
@@ -9,20 +10,20 @@ from fastapi.responses import JSONResponse
 from config import UPLOAD_DIR, WEAVIATE_URL, ELASTICSEARCH_URL, EMBEDDING_MODEL, USE_ELASTICSEARCH
 from ingestion.tasks import process_pdf_task
 from stores import get_store, close_all, WeaviateStore, ElasticsearchStore
-from retrieval.reranker import rerank_cross_encoder
+from retrieval.reranker import warmup_cross_encoder
 from api.schemas import SearchRequest, SearchRequestWithContext
-from retrieval.fusion import combine_search_results_with_rrf
 from api.deps import get_weaviate_store, get_elasticsearch_store
-from retrieval.hyde import generate_hypothetical_document
+from retrieval.pipeline import run_hybrid_search
 
-
-print(USE_ELASTICSEARCH, "USE_ELASTICSEARCH")
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting API with USE_ELASTICSEARCH=%s", USE_ELASTICSEARCH)
     get_store("weaviate", weaviate_url=WEAVIATE_URL, embedding_model=EMBEDDING_MODEL)
     if USE_ELASTICSEARCH:
         get_store("elasticsearch", elasticsearch_url=ELASTICSEARCH_URL)
+    warmup_cross_encoder()
     yield
     close_all()
 
@@ -183,7 +184,9 @@ def search_by_keywords(
         if elasticsearch_store is not None:
             results = elasticsearch_store.search(search_query, n_results=search_limit)
         else:
-            results = vector_store.hybrid_search(search_query, n_results=search_limit, alpha=0.0)
+            results = vector_store.hybrid_search(
+                search_query, search_query, n_results=search_limit, alpha=0.0
+            )
         return JSONResponse(results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error searching: {str(e)}")
@@ -196,40 +199,22 @@ def search_double(
 ):
     """
     Hybrid search combining semantic and keyword results.
-    Uses Weaviate+Elasticsearch with RRF fusion when ES is enabled,
-    or Weaviate's built-in hybrid search when ES is disabled.
+
+    Uses Weaviate + Elasticsearch with RRF fusion when Elasticsearch is enabled,
+    or Weaviate's built-in alpha-blended hybrid search when it is disabled.
+    The response reports which mode ran via "retrieval_mode".
     """
-    search_query = body.q
-    search_limit = body.limit or 5
-    fetch_limit = search_limit * 4
-    RRF_K = 60
     try:
-        vector_query = generate_hypothetical_document(search_query) if body.use_hyde else search_query
-        print(f"Search query: {search_query}")
-        print(f"Vector query: {vector_query}")
-
-        if elasticsearch_store is None:
-            hybrid_results = vector_store.hybrid_search(vector_query, n_results=fetch_limit)
-            final_results = rerank_cross_encoder(search_query, hybrid_results["objects"], top_n=search_limit)
-            return JSONResponse({
-                "objects": final_results,
-                "combined_count": len(final_results),
-            })
-
-        weaviate_results = vector_store.search(vector_query, n_results=fetch_limit)
-        elasticsearch_results = elasticsearch_store.search(search_query, n_results=fetch_limit)
-        rrf_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
-            weaviate_results, elasticsearch_results, fetch_limit, RRF_K
+        outcome = run_hybrid_search(
+            body.q,
+            vector_store,
+            elasticsearch_store,
+            limit=body.limit or 5,
+            use_hyde=body.use_hyde,
+            rerank=body.rerank,
+            alpha=body.alpha,
         )
-        final_results = rerank_cross_encoder(search_query, rrf_results, top_n=search_limit)
-        return JSONResponse({
-            "objects": final_results,
-            "weaviate_count": weaviate_count,
-            "elasticsearch_count": elasticsearch_count,
-            "combined_count": len(final_results),
-            "unique_count": len(combined_results),
-            "rrf_k": RRF_K
-        })
+        return JSONResponse({"objects": outcome.objects, **outcome.stats})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in double search: {str(e)}")
 
@@ -244,30 +229,19 @@ def search_double_with_context(
     Groups results by document, expands each hit by N chunks before/after,
     and returns merged text per document.
     """
-    search_query = body.q
-    search_limit = body.limit or 5
-    fetch_limit = search_limit * 4
-    context_chunks = body.context_chunks or 3
-    RRF_K = 60
+    context_chunks = body.context_chunks if body.context_chunks is not None else 3
     try:
-        vector_query = generate_hypothetical_document(search_query) if body.use_hyde else search_query
-
-        if elasticsearch_store is None:
-            hybrid_results = vector_store.hybrid_search(vector_query, n_results=fetch_limit)
-            final_results = rerank_cross_encoder(search_query, hybrid_results["objects"], top_n=search_limit)
-            chunk_store = vector_store
-            weaviate_count = len(hybrid_results["objects"])
-            elasticsearch_count = 0
-            unique_count = len(final_results)
-        else:
-            weaviate_results = vector_store.search(vector_query, n_results=fetch_limit)
-            elasticsearch_results = elasticsearch_store.search(search_query, n_results=fetch_limit)
-            rrf_results, combined_results, weaviate_count, elasticsearch_count = combine_search_results_with_rrf(
-                weaviate_results, elasticsearch_results, fetch_limit, RRF_K
-            )
-            final_results = rerank_cross_encoder(search_query, rrf_results, top_n=search_limit)
-            chunk_store = elasticsearch_store
-            unique_count = len(combined_results)
+        outcome = run_hybrid_search(
+            body.q,
+            vector_store,
+            elasticsearch_store,
+            limit=body.limit or 5,
+            use_hyde=body.use_hyde,
+            rerank=body.rerank,
+            alpha=body.alpha,
+        )
+        final_results = outcome.objects
+        chunk_store = outcome.chunk_store
 
         # Group results by document (file_id)
         documents = {}
@@ -321,11 +295,7 @@ def search_double_with_context(
         return JSONResponse({
             "documents": documents_with_context,
             "document_count": len(documents_with_context),
-            "weaviate_count": weaviate_count,
-            "elasticsearch_count": elasticsearch_count,
-            "combined_count": len(final_results),
-            "unique_count": unique_count,
-            "rrf_k": RRF_K if elasticsearch_store else None,
+            **outcome.stats,
             "context_chunks": context_chunks
         })
     except Exception as e:

@@ -1,93 +1,85 @@
 """
-Reciprocal Rank Fusion (RRF) for combining Weaviate and Elasticsearch search results.
+Reciprocal Rank Fusion (RRF) over a vector result set and a keyword result set.
+
+RRF ignores score magnitudes and works purely on ranks, which is what makes it
+safe across two engines whose scores are not on a comparable scale.
 """
 
 
 def combine_search_results_with_rrf(
-    weaviate_results: dict,
-    elasticsearch_results: dict,
-    search_limit: int,
+    vector_results: dict,
+    keyword_results: dict,
+    fetch_limit: int,
     rrf_k: int = 60,
 ):
     """
-    Combine Weaviate and Elasticsearch search results using Reciprocal Rank Fusion (RRF) algorithm.
+    Fuse a vector result set and a keyword result set with Reciprocal Rank Fusion.
+
+        score = sum over sources of 1 / (k + rank)
 
     Args:
-        weaviate_results: Results from Weaviate search
-        elasticsearch_results: Results from Elasticsearch search
-        search_limit: Maximum number of results to return
-        rrf_k: RRF constant (default 60)
+        vector_results:  {"objects": [...]} from semantic search
+        keyword_results: {"objects": [...]} from BM25 search
+        fetch_limit:     how many fused candidates to keep. This is the
+                         pre-rerank budget, not the caller's final result count.
+        rrf_k:           RRF constant (default 60)
 
     Returns:
-        Tuple of (final_results, combined_results, weaviate_count, elasticsearch_count)
+        (fused_results, combined_results, vector_count, keyword_count)
     """
-    # Track ranks for each result in each source
-    # Key: (file_id, chunk_index), Value: dict with result data and ranks
+    # Key: (file_id, chunk_index) -> result data plus its rank in each source
     combined_results = {}
 
-    # Process Weaviate results with ranks (1-indexed)
-    for rank, obj in enumerate(weaviate_results.get("objects", []), start=1):
+    # Vector results, ranked 1-indexed
+    for rank, obj in enumerate(vector_results.get("objects", []), start=1):
         key = (obj.get("file_id"), obj.get("chunk_index"))
         if key not in combined_results:
             combined_results[key] = {
                 **obj,
-                "sources": ["weaviate"],
-                "weaviate_rank": rank,
-                "elasticsearch_rank": None,
+                "sources": ["vector"],
+                "vector_rank": rank,
+                "keyword_rank": None,
             }
         else:
-            # Update existing result with Weaviate rank
-            combined_results[key]["weaviate_rank"] = rank
-            if "weaviate" not in combined_results[key]["sources"]:
-                combined_results[key]["sources"].append("weaviate")
-            # Preserve Weaviate-specific metadata
+            combined_results[key]["vector_rank"] = rank
+            if "vector" not in combined_results[key]["sources"]:
+                combined_results[key]["sources"].append("vector")
+            # Preserve the vector-specific metric
             if "distance" in obj:
                 combined_results[key]["distance"] = obj["distance"]
 
-    # Process Elasticsearch results with ranks (1-indexed)
-    for rank, obj in enumerate(elasticsearch_results.get("objects", []), start=1):
+    # Keyword results, ranked 1-indexed
+    for rank, obj in enumerate(keyword_results.get("objects", []), start=1):
         key = (obj.get("file_id"), obj.get("chunk_index"))
         if key not in combined_results:
             combined_results[key] = {
                 **obj,
-                "sources": ["elasticsearch"],
-                "weaviate_rank": None,
-                "elasticsearch_rank": rank,
+                "sources": ["keyword"],
+                "vector_rank": None,
+                "keyword_rank": rank,
             }
         else:
-            # Update existing result with Elasticsearch rank
-            combined_results[key]["elasticsearch_rank"] = rank
-            if "elasticsearch" not in combined_results[key]["sources"]:
-                combined_results[key]["sources"].append("elasticsearch")
-            # Preserve Elasticsearch-specific metadata
+            combined_results[key]["keyword_rank"] = rank
+            if "keyword" not in combined_results[key]["sources"]:
+                combined_results[key]["sources"].append("keyword")
+            # Preserve the keyword-specific metric
             if "score" in obj:
                 combined_results[key]["score"] = obj["score"]
-            if "highlight" in obj:
-                combined_results[key]["highlight"] = obj["highlight"]
 
-    # Calculate RRF scores for each result
-    # RRF_score = sum(1 / (k + rank)) for each source where result appears
-    for key, result in combined_results.items():
+    # RRF score: one contribution per source the result appears in
+    for result in combined_results.values():
         rrf_score = 0.0
-
-        # Add contribution from Weaviate rank if present
-        if result.get("weaviate_rank") is not None:
-            rrf_score += 1.0 / (rrf_k + result["weaviate_rank"])
-
-        # Add contribution from Elasticsearch rank if present
-        if result.get("elasticsearch_rank") is not None:
-            rrf_score += 1.0 / (rrf_k + result["elasticsearch_rank"])
-
+        if result.get("vector_rank") is not None:
+            rrf_score += 1.0 / (rrf_k + result["vector_rank"])
+        if result.get("keyword_rank") is not None:
+            rrf_score += 1.0 / (rrf_k + result["keyword_rank"])
         result["rrf_score"] = rrf_score
 
-    # Convert to list and sort by RRF score (descending)
-    final_results = list(combined_results.values())
-    final_results.sort(key=lambda x: x.get("rrf_score", 0.0), reverse=True)
+    fused_results = list(combined_results.values())
+    fused_results.sort(key=lambda x: x.get("rrf_score", 0.0), reverse=True)
+    fused_results = fused_results[:fetch_limit]
 
-    # Limit to requested number of results
-    final_results = final_results[:search_limit]
+    vector_count = len(vector_results.get("objects", []))
+    keyword_count = len(keyword_results.get("objects", []))
 
-    weaviate_count = len(weaviate_results.get("objects", []))
-    elasticsearch_count = len(elasticsearch_results.get("objects", []))
-
-    return final_results, combined_results, weaviate_count, elasticsearch_count
+    return fused_results, combined_results, vector_count, keyword_count

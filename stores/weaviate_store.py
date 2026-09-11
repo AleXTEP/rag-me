@@ -125,11 +125,26 @@ class WeaviateStore(BaseStore):
 
         return formatted_results
 
-    def hybrid_search(self, query: str, n_results: int = 5, alpha: float = 0.5):
+    def hybrid_search(
+        self,
+        keyword_query: str,
+        vector_query: str,
+        n_results: int = 5,
+        alpha: float = 0.5,
+    ):
+        """
+        Weaviate built-in hybrid search: BM25 over `keyword_query`, vector search
+        over the embedding of `vector_query`, blended by `alpha`
+        (0 = pure BM25, 1 = pure vector).
+
+        The two arguments differ only under HyDE, where BM25 needs the user's
+        actual words while the vector half gets the hypothetical passage.
+        Without HyDE, callers pass the same string twice.
+        """
         collection = self.client.collections.get(self.collection_name)
-        query_embedding = self.embedding_model.encode([query]).tolist()[0]
+        query_embedding = self.embed_query(vector_query)
         results = collection.query.hybrid(
-            query=query,
+            query=keyword_query,
             vector=query_embedding,
             alpha=alpha,
             limit=n_results,
@@ -190,24 +205,29 @@ class WeaviateStore(BaseStore):
         return chunk_count
 
     def get_chunks_by_range(self, file_id: str, chunk_indices: List[int]):
+        if not chunk_indices:
+            return []
+
         collection = self.client.collections.get(self.collection_name)
 
         results = collection.query.fetch_objects(
-            limit=10000,
-            filters=Filter.by_property("file_id").equal(file_id)
+            limit=len(chunk_indices),
+            filters=(
+                Filter.by_property("file_id").equal(file_id) &
+                Filter.by_property("chunk_index").contains_any(list(chunk_indices))
+            )
         )
 
-        chunks = []
-        for obj in results.objects:
-            chunk_idx = obj.properties["chunk_index"]
-            if chunk_idx in chunk_indices:
-                chunks.append({
-                    "chunk_index": chunk_idx,
-                    "text": obj.properties["text"],
-                    "file_id": obj.properties["file_id"],
-                    "filename": obj.properties["filename"],
-                    "page_number": obj.properties.get("page_number", 1)
-                })
+        chunks = [
+            {
+                "chunk_index": obj.properties["chunk_index"],
+                "text": obj.properties["text"],
+                "file_id": obj.properties["file_id"],
+                "filename": obj.properties["filename"],
+                "page_number": obj.properties.get("page_number", 1)
+            }
+            for obj in results.objects
+        ]
 
         chunks.sort(key=lambda x: x["chunk_index"])
         return chunks
