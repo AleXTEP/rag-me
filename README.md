@@ -1,8 +1,9 @@
-# RAG
+# RAG-me
 
 A Retrieval-Augmented Generation backend built with FastAPI, Celery, Weaviate, and Elasticsearch. Supports vector, keyword, and hybrid search with RRF fusion, cross-encoder reranking, HyDE query expansion, and OCR fallback for scanned PDFs.
 
-## Stack
+
+## Components
 
 | Component | Role |
 |---|---|
@@ -16,63 +17,97 @@ A Retrieval-Augmented Generation backend built with FastAPI, Celery, Weaviate, a
 | CrossEncoder | Reranking (`ms-marco-MiniLM-L-6-v2` default) |
 | HyDE | Hypothetical document expansion before vector search |
 
-## Components
 
-### `ingestion/`
-- **`pdf_processor.py`** — Full PDF pipeline: browser-PDF detection, page extraction, header/footer dedup, text normalization, fixed or semantic chunking with overlap, page offset mapping, OCR fallback.
-- **`ocr.py`** — Tesseract-based OCR for image-only PDFs, with optional API-based providers.
-- **`tasks.py`** — Celery task that runs the ingestion pipeline and writes chunks to Weaviate and Elasticsearch.
+## Project Structure
 
-### `retrieval/`
-- **`fusion.py`** — Reciprocal Rank Fusion (RRF) over a vector result set and a keyword result set. Formula: `Σ 1 / (k + rank)`, default k=60. Rank-based, so it is safe across engines whose scores are not comparable.
-- **`reranker.py`** — Cross-encoder reranking (lazy-loaded). Scores `(query, chunk)` pairs and returns top-N.
-- **`hyde.py`** — HyDE: generates a 3–5 sentence hypothetical answer via an LLM, embeds that instead of the raw query. Affects only the vector half; keyword matching and reranking stay on the user's words. Supports Claude, OpenAI, and local Ollama providers.
-- **`pipeline.py`** — Shared hybrid retrieval used by both `/search/double` endpoints. Selects the retrieval mode, applies HyDE, fuses, reranks.
+```
+rag/
+├── api/
+│   ├── main.py              # Route definitions
+│   ├── deps.py              # Store dependency injection
+│   └── schemas.py           # Request/response models
+├── ingestion/
+│   ├── pdf_processor.py     # PDF extraction + chunking pipeline
+│   ├── ocr.py               # OCR fallback
+│   └── tasks.py             # Celery ingestion task
+├── retrieval/
+│   ├── fusion.py            # RRF fusion
+│   ├── reranker.py          # Cross-encoder reranking
+│   └── hyde.py              # HyDE query expansion
+├── stores/
+│   ├── weaviate_store.py    # Weaviate operations
+│   ├── elasticsearch_store.py
+│   └── base.py
+├── worker/
+│   └── celery_app.py        # Celery configuration
+├── config.py                # Env-var config
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+└── tests/
+```
 
-### `stores/`
-- **`weaviate_store.py`** — Weaviate client: upsert chunks with embeddings, vector search, alpha-blended hybrid search, chunk range fetch, document delete.
-- **`elasticsearch_store.py`** — ES client: index chunks, BM25 keyword search, chunk range fetch, document delete.
-- **`base.py`** — Shared store interface.
+#### `ingestion/`
+- `pdf_processor.py` — Full PDF pipeline: browser-PDF detection, page extraction, header/footer dedup, text normalization, fixed or semantic chunking with overlap, page offset mapping, OCR fallback.
+- `ocr.py` — Tesseract-based OCR for image-only PDFs, with optional API-based providers.
+- `tasks.py` — Celery task that runs the ingestion pipeline and writes chunks to Weaviate and Elasticsearch.
 
-### `api/`
-- **`main.py`** — Route definitions. Retrieval itself lives in `retrieval/pipeline.py`.
-- **`deps.py`** — FastAPI dependency injection for store singletons.
-- **`schemas.py`** — Pydantic request models.
+#### `retrieval/`
+- `fusion.py` — Reciprocal Rank Fusion (RRF).
+- `reranker.py` — Cross-encoder reranking. Scores (query, chunk) pairs and returns top-N.
+- `hyde.py` — HyDE: generates a 3–5 sentence hypothetical answer via an LLM, embeds that instead of the raw query. Affects only the vector half; keyword matching and reranking stay on the user's words.
+- `pipeline.py` — Shared hybrid retrieval used by both `/search/double` endpoints. Selects the retrieval mode, applies HyDE, fuses, reranks.
 
-### `worker/`
-- **`celery_app.py`** — Celery application configuration (broker: Redis).
+#### `stores/`
+- `weaviate_store.py` — Weaviate client: upsert chunks with embeddings, vector search, alpha-blended hybrid search, chunk range fetch, document delete.
+- `elasticsearch_store.py` — ES client: index chunks, BM25 keyword search, chunk range fetch, document delete.
+- `base.py` — Shared store interface.
 
-## Ingestion Pipeline
+#### `api/`
+- `main.py` — Route definitions. Retrieval itself lives in `retrieval/pipeline.py`.
+- `deps.py` — FastAPI dependency injection for store singletons.
+- `schemas.py` — Pydantic request models.
+
+#### `worker/`
+- `celery_app.py` — Celery application configuration (broker: Redis).
+
+<!-- ## Ingestion Pipeline
 
 ```
 POST /upload
-  → save file to disk
-  → enqueue Celery task
-      → extract text per page (PyMuPDF, sort=True for browser PDFs)
-      → OCR fallback if no text found
-      → strip page numbers, remove repeated headers/footers
-      → normalize text (line merging, bullet normalization)
-      → chunk: fixed (paragraph → sentence → word) or semantic (embedding similarity)
-      → apply overlap (fixed only)
-      → map chunks to page numbers via character offsets
-      → write to Weaviate (vectors) + Elasticsearch (text)
-      → delete temp file
+
+save file to disk
+enqueue Celery task
+  - extract text per page (PyMuPDF)
+  - OCR fallback if no text found
+  - strip page numbers, remove repeated headers/footers
+  - normalize text (line merging, bullet normalization)
+  - chunk: fixed (paragraph → sentence → word) or semantic (embedding similarity)
+  - apply overlap (fixed only)
+  - map chunks to page numbers via character offsets
+  - write to Weaviate (vectors) + Elasticsearch (text)
+  - delete temp file
 ```
 
 ## Search Pipeline (hybrid)
 
 ```
 POST /search/double or /search/double/context
-  → optional HyDE: query → LLM → hypothetical passage → embed (vector half only)
-  → mode "rrf"             (Elasticsearch enabled):
-      → Weaviate vector search (fetch_limit = limit × 4)
-      → Elasticsearch BM25 search (fetch_limit)
-      → RRF fusion (k=60) over both result sets
-  → mode "weaviate_hybrid" (Elasticsearch disabled):
-      → Weaviate built-in hybrid(), vector/BM25 blended by `alpha` in one call
-  → optional CrossEncoder reranking (always on the raw query) → top N
-  → /context variant: group by document, expand ±N chunks, merge text
-```
+
+Optional HyDE: query, LLM, hypothetical passage, embed
+
+Elasticsearch enabled: mode "rrf":
+  - Weaviate vector search (fetch_limit = limit × 4)
+  - Elasticsearch BM25 search (fetch_limit)
+  - RRF fusion (k=60) over both result sets
+
+Elasticsearch disabled: mode "weaviate_hybrid":
+  - Weaviate built-in hybrid(), vector/BM25 blended by `alpha` in one call
+
+Optional CrossEncoder reranking (always on the raw query), top N
+
+/context variant: group by document, expand ±N chunks, merge text
+``` -->
 
 ## Configuration
 
@@ -114,12 +149,12 @@ Allow 30–60 seconds for health checks before the API accepts requests.
 
 ## API Endpoints
 
-### `GET /health`
+#### `GET /health`
 Returns `{"status": "healthy"}`.
 
 ---
 
-### `POST /upload`
+#### `POST /upload`
 Upload a PDF for async ingestion.
 
 **Body:** `multipart/form-data`, field `file` (`.pdf` only).
@@ -139,7 +174,7 @@ Returns `409` if the filename already exists.
 
 ---
 
-### `GET /task/{task_id}`
+#### `GET /task/{task_id}`
 Poll ingestion task status.
 
 **States:** `PENDING` | `PROGRESS` | `SUCCESS` | `FAILURE`
@@ -159,7 +194,7 @@ Poll ingestion task status.
 
 ---
 
-### `GET /documents`
+#### `GET /documents`
 List all indexed documents with chunk counts.
 
 ```json
@@ -171,7 +206,7 @@ List all indexed documents with chunk counts.
 
 ---
 
-### `DELETE /documents/{file_id}`
+#### `DELETE /documents/{file_id}`
 Remove a document from Weaviate and Elasticsearch.
 
 ```json
@@ -185,7 +220,7 @@ Remove a document from Weaviate and Elasticsearch.
 
 ---
 
-### `POST /search/vector`
+#### `POST /search/vector`
 Pure vector similarity search via Weaviate.
 
 **Body:**
@@ -197,7 +232,7 @@ Pure vector similarity search via Weaviate.
 
 ---
 
-### `POST /search/keywords`
+#### `POST /search/keywords`
 BM25 keyword search. Uses Elasticsearch when enabled, falls back to Weaviate BM25.
 
 **Body:**
@@ -209,7 +244,7 @@ BM25 keyword search. Uses Elasticsearch when enabled, falls back to Weaviate BM2
 
 ---
 
-### `POST /search/double`
+#### `POST /search/double`
 Hybrid search: vector + keyword → RRF fusion → cross-encoder rerank.
 
 Supports `use_hyde: true` to expand the query via HyDE before vector search, and
@@ -256,7 +291,7 @@ When Elasticsearch is disabled the same endpoint returns the alpha-blend diagnos
 
 ---
 
-### `POST /search/double/context`
+#### `POST /search/double/context`
 Hybrid search with chunk-window expansion, grouped by document.
 
 Runs the same retrieval pipeline as `/search/double`, then for each matched document: collects all hit chunk indices, expands each by `±context_chunks`, fetches the full range from the store, and joins the text.
@@ -292,31 +327,3 @@ Runs the same retrieval pipeline as `/search/double`, then for each matched docu
 }
 ```
 
-## Project Structure
-
-```
-rag2/
-├── api/
-│   ├── main.py              # Route definitions
-│   ├── deps.py              # Store dependency injection
-│   └── schemas.py           # Request/response models
-├── ingestion/
-│   ├── pdf_processor.py     # PDF extraction + chunking pipeline
-│   ├── ocr.py               # OCR fallback
-│   └── tasks.py             # Celery ingestion task
-├── retrieval/
-│   ├── fusion.py            # RRF fusion
-│   ├── reranker.py          # Cross-encoder reranking
-│   └── hyde.py              # HyDE query expansion
-├── stores/
-│   ├── weaviate_store.py    # Weaviate operations
-│   ├── elasticsearch_store.py
-│   └── base.py
-├── worker/
-│   └── celery_app.py        # Celery configuration
-├── config.py                # Env-var config
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-└── tests/
-```
